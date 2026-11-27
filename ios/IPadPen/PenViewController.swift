@@ -22,6 +22,7 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate, UI
     private var videoShown = false
     private var videoSize: CGSize?
     private var localInkEnabled = true
+    private var inkStyle = InkStyle.standard
 
     // Local ink: one layer per stroke, inside a container clipped to the video.
     private let inkContainer = CALayer()
@@ -112,11 +113,15 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate, UI
         decoder.onConfig = { [weak self] flags in
             self?.localInkEnabled = (flags & 0x01) != 0
         }
+        decoder.onInkStyle = { [weak self] style in
+            self?.inkStyle = style
+        }
         videoServer.onConnected = { [weak self] in
             guard let self = self else { return }
             self.decoder.reset()
             self.videoSize = nil
             self.localInkEnabled = true
+            self.inkStyle = InkStyle.standard
         }
         videoServer.onDisconnected = { [weak self] in
             guard let self = self else { return }
@@ -231,11 +236,24 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate, UI
 
     private func inkBegin(_ touch: UITouch) {
         guard inkActive else { return }
+        let style = inkStyle
+        if style.tool == 3 { return }  // eraser: no local ink
         let stroke = CAShapeLayer()
         stroke.frame = inkContainer.bounds
-        stroke.strokeColor = PenViewController.localInkColor.cgColor
         stroke.fillColor = nil
-        stroke.lineWidth = PenViewController.localInkWidth
+        if style.tool == 0 || style.width <= 0 {
+            stroke.strokeColor = PenViewController.localInkColor.cgColor
+            stroke.lineWidth = PenViewController.localInkWidth
+        } else {
+            // Colour with its own alpha on a single path: overlapping parts of
+            // one stroke are not drawn twice.
+            stroke.strokeColor = UIColor(red: CGFloat(style.red) / 255, green: CGFloat(style.green) / 255,
+                                         blue: CGFloat(style.blue) / 255, alpha: CGFloat(style.alpha) / 255).cgColor
+            // Video pixels -> points: the picture is drawn videoRect().width points wide.
+            var pointsPerVideoPx: CGFloat = 1
+            if let size = videoSize, size.width > 0 { pointsPerVideoPx = videoRect().width / size.width }
+            stroke.lineWidth = max(0.5, CGFloat(style.width) * pointsPerVideoPx)
+        }
         stroke.lineCap = .round
         stroke.lineJoin = .round
         stroke.actions = ["path": NSNull(), "position": NSNull(), "bounds": NSNull()]

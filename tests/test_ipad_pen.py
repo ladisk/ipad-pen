@@ -22,6 +22,7 @@ from ipad_pen.protocol import (
     HELLO_V2,
     KIND_AU,
     KIND_CONFIG,
+    KIND_INK,
     KIND_SIZE,
     MAX_VIDEO_FRAME,
     PHASE_DOWN,
@@ -41,6 +42,7 @@ from ipad_pen.protocol import (
     decode,
     encode,
     encode_video,
+    encode_video_ink,
     encode_video_size,
     read_frame,
     read_video_frame,
@@ -366,10 +368,22 @@ def run_display(extra_args: list[str], hypr) -> dict:
             await asyncio.wait_for(run(args, sink=FakeSink(), hypr=hypr, encoder_argv=encoder), 15)
             got["elapsed"] = asyncio.get_running_loop().time() - t0
 
-    asyncio.run(scenario())
+    old = os.environ.get("XDG_RUNTIME_DIR")
+    os.environ["XDG_RUNTIME_DIR"] = "/nonexistent"  # no real saber-ink.json
+    try:
+        asyncio.run(scenario())
+    finally:
+        if old is None:
+            os.environ.pop("XDG_RUNTIME_DIR")
+        else:
+            os.environ["XDG_RUNTIME_DIR"] = old
     msgs = got["msgs"]
     assert len(msgs) == 7 and got["elapsed"] < 10
     got["config"] = msgs.pop(0)
+    ink_on = "--no-local-ink" not in extra_args
+    assert [k for k, _ in msgs[:2]] == [KIND_SIZE, KIND_INK if ink_on else KIND_AU]
+    if ink_on:
+        msgs.pop(1)  # the default ink style, sent after the size
     assert all(kind == KIND_AU for kind, _ in msgs[1:])
     types = nal_types(msgs[1][1])
     assert types[:2] == [7, 8] and 5 in types  # SPS, PPS, IDR first
@@ -627,3 +641,76 @@ def test_constant_pressure_by_default():
     m = Mapper(sink, pressure=True)
     m.handle(Sample(PHASE_MOVE, 0.5, 0.5, 0.2, 1.0, 0.0, 0.0))
     assert (e.EV_ABS, e.ABS_PRESSURE, round(0.2 * PRESSURE_MAX)) in sink.frames[-1]
+
+
+# --- Saber ink style --------------------------------------------------------
+
+GOOD_INK = {"v": 1, "tool": "pen", "color": "#FF8000CC", "width": 3.5, "pid": 4242}
+
+
+def test_parse_ink_file_valid():
+    from ipad_pen.ink import TOOL_HIGHLIGHTER, TOOL_PEN, parse_ink_file
+
+    f = parse_ink_file(json.dumps(GOOD_INK))
+    assert (f.tool, f.rgba, f.width, f.pid) == (TOOL_PEN, (255, 128, 0, 204), 3.5, 4242)
+    f = parse_ink_file(json.dumps({**GOOD_INK, "tool": "highlighter", "color": "#00ff00", "width": 12}))
+    assert (f.tool, f.rgba, f.width) == (TOOL_HIGHLIGHTER, (0, 255, 0, 255), 12.0)
+
+
+@pytest.mark.parametrize("change", [
+    {"v": 2}, {"v": True}, {"tool": "brush"}, {"tool": 1}, {"color": "red"}, {"color": "#12345"},
+    {"color": None}, {"width": 0}, {"width": -1}, {"width": "3"}, {"width": True}, {"width": 1e9},
+    {"width": float("nan")}, {"pid": 0}, {"pid": "1"}, {"pid": 1.5}, {"pid": True},
+])
+def test_parse_ink_file_rejects(change):
+    from ipad_pen.ink import parse_ink_file
+
+    assert parse_ink_file(json.dumps({**GOOD_INK, **change})) is None
+
+
+@pytest.mark.parametrize("raw", [b"", b"{", b"[]", b"null", b"\xff\xfe", b'{"v":1}', b"[" * 100000])
+def test_parse_ink_file_malformed(raw):
+    from ipad_pen.ink import parse_ink_file
+
+    assert parse_ink_file(raw) is None
+
+
+def test_video_width_conversion():
+    from ipad_pen.ink import video_width
+
+    # 2 logical px, scale 1.5, 3840 px output sent as 1920: 2 * 1.5 * 0.5
+    assert video_width(2.0, 1.5, 3840, 1920) == pytest.approx(1.5)
+    assert video_width(2.0, 1.0, 1920, 1920) == pytest.approx(2.0)
+
+
+def test_encode_video_ink():
+    msg = encode_video_ink(2, (1, 2, 3, 4), 2.5)
+    assert msg == struct.pack("<IB", 10, KIND_INK) + struct.pack("<BBBBBf", 2, 1, 2, 3, 4, 2.5)
+    frame = asyncio.run(_read_one(msg))
+    assert frame[0] == KIND_INK and len(frame[1]) == 9
+
+
+def test_ink_tracker(tmp_path):
+    from ipad_pen.ink import DEFAULT_STYLE, InkStyle, InkTracker
+
+    path = tmp_path / "saber-ink.json"
+    alive = {4242}
+    t = InkTracker(path, lambda: (2.0, 3840), 1920, alive=lambda pid: pid in alive)
+    assert t.poll() is None  # no file, already default
+    path.write_text(json.dumps(GOOD_INK))
+    assert t.poll() == InkStyle(1, (255, 128, 0, 204), 3.5)  # 3.5 * 2 * 0.5
+    assert t.poll() is None
+    alive.clear()  # Saber exited
+    assert t.poll() == DEFAULT_STYLE
+    alive.add(4242)
+    assert t.poll() == InkStyle(1, (255, 128, 0, 204), 3.5)
+    path.write_text("garbage")
+    assert t.poll() == DEFAULT_STYLE
+    path.write_text(json.dumps({**GOOD_INK, "width": 7}))
+    assert t.poll().width == 7.0
+    path.unlink()
+    assert t.poll() == DEFAULT_STYLE
+
+
+async def _read_one(data: bytes):
+    return await read_video_frame(_reader(data))

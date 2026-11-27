@@ -12,6 +12,19 @@ final class VideoView: UIView {
     }
 }
 
+// Ink style (kind 4): tool 0 default grey, 1 pen, 2 highlighter, 3 eraser;
+// colour 0...255; width in video pixels.
+struct InkStyle {
+    var tool: UInt8
+    var red: UInt8
+    var green: UInt8
+    var blue: UInt8
+    var alpha: UInt8
+    var width: Float
+
+    static let standard = InkStyle(tool: 0, red: 0, green: 0, blue: 0, alpha: 0, width: 0)
+}
+
 // Reads the video connection (messages: u32 little-endian length, u8 kind,
 // payload; see PROTOCOL.md) and shows every H.264 access unit on an
 // AVSampleBufferDisplayLayer. Runs on the main queue.
@@ -20,12 +33,15 @@ final class VideoDecoder {
     static let kindSize: UInt8 = 1
     static let kindAccessUnit: UInt8 = 2
     static let kindConfig: UInt8 = 3
+    static let kindInk: UInt8 = 4
 
     var onFirstFrame: (() -> Void)?
     // Picture size in pixels (kind 1).
     var onVideoSize: ((CGSize) -> Void)?
     // Config flags (kind 3); bit 0 = local ink.
     var onConfig: ((UInt8) -> Void)?
+    // Ink style (kind 4).
+    var onInkStyle: ((InkStyle) -> Void)?
 
     private let layer: AVSampleBufferDisplayLayer
     private var buffer = [UInt8]()
@@ -85,10 +101,16 @@ final class VideoDecoder {
                 if let flags = payload.first {
                     onConfig?(flags)
                 }
-            } else {
-                buffer.removeAll()
-                return false
+            } else if kind == VideoDecoder.kindInk {
+                if payload.count >= 9 {
+                    let bits = UInt32(payload[5]) | UInt32(payload[6]) << 8
+                        | UInt32(payload[7]) << 16 | UInt32(payload[8]) << 24
+                    onInkStyle?(InkStyle(tool: payload[0], red: payload[1], green: payload[2],
+                                         blue: payload[3], alpha: payload[4],
+                                         width: Float(bitPattern: bits)))
+                }
             }
+            // Unknown kinds are skipped (the length is already consumed).
         }
         if offset > 0 {
             buffer.removeFirst(min(offset, buffer.count))

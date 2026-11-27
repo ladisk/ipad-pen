@@ -100,12 +100,13 @@ The laptop sends messages. Each message:
 | 5      | N - 1   | payload                                    |
 
 Python: `struct.Struct("<IB")` + payload. N is 2 to 16 MiB; the iPad drops
-the connection on any other value or an unknown kind.
+the connection on any other value. The iPad ignores a message of an unknown kind.
 
 | Kind | Name        | Payload                                                        |
 |------|-------------|----------------------------------------------------------------|
 | 3    | config      | `u8` flags; bit 0 = local ink on. Sent first, once.             |
 | 1    | size        | `u16` width, `u16` height of the picture in pixels. Sent before the first access unit. |
+| 4    | ink style   | `u8` tool, `u8` r, `u8` g, `u8` b, `u8` a, `f32` width. Sent after the size, then at every change. |
 | 2    | access unit | one H.264 access unit (one picture), Annex-B (start code before every NAL unit) |
 
 The picture is H.264 High profile, no B-frames, in decode order with no
@@ -125,6 +126,18 @@ Without video the position is a fraction of the whole view.
 Local ink: the iPad draws the current stroke itself (thin grey line, clipped
 to the picture) and fades it out about 300 ms after the pen goes up, when the
 real stroke has arrived in the video. The laptop turns it off with flags = 0.
+
+Ink style (kind 4, payload 9 bytes, `struct.Struct("<BBBBBf")`): the colour and
+width of the local ink. `tool`: 0 default (thin dark grey, as without this
+message), 1 pen, 2 highlighter, 3 eraser (no local ink). `r, g, b, a`: colour,
+0 to 255 (the alpha of a highlighter is in `a`). `width`: stroke width in
+video pixels; the iPad draws it as `width * (picture width in points / picture
+width in pixels)` points. The laptop reads the style from the note app Saber
+(`$XDG_RUNTIME_DIR/saber-ink.json`: `v` 1, `tool` pen, highlighter, eraser or
+other, `color` `#RRGGBBAA`, `width` in logical pixels of its monitor, `pid`).
+It sends tool 0 when the file is missing, malformed or its `pid` is not alive,
+and only when local ink is on. The width is `logical * monitor scale *
+picture width / output width in pixels`.
 
 ## Compatibility
 

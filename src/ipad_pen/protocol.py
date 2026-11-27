@@ -51,6 +51,8 @@ VIDEO_SIZE = struct.Struct("<HH")  # picture width, height in pixels
 KIND_SIZE = 1
 KIND_AU = 2
 KIND_CONFIG = 3
+KIND_INK = 4
+VIDEO_INK = struct.Struct("<BBBBBf")  # tool, r, g, b, a, width in video pixels
 VIDEO_CONFIG = struct.Struct("<B")  # flags
 CONFIG_LOCAL_INK = 0x01
 MAX_VIDEO_FRAME = 16 << 20
@@ -365,9 +367,29 @@ async def read_video_frame(reader) -> tuple[int, bytes] | None:
     size, kind = VIDEO_HEADER.unpack(head)
     if size < 2 or size > MAX_VIDEO_FRAME:
         raise ProtocolError(f"bad video frame length {size}")
-    if kind not in (KIND_SIZE, KIND_AU, KIND_CONFIG):
+    if kind not in (KIND_SIZE, KIND_AU, KIND_CONFIG, KIND_INK):
         raise ProtocolError(f"unknown video message kind {kind}")
     return kind, await reader.readexactly(size - 1)
+
+
+def encode_video_ink(tool: int, rgba: tuple[int, int, int, int], width: float) -> bytes:
+    """Frame the ink style message (kind 4).
+
+    Parameters
+    ----------
+    tool : int
+        0 default grey, 1 pen, 2 highlighter, 3 eraser (no local ink).
+    rgba : tuple of int
+        Colour, four values 0..255.
+    width : float
+        Stroke width in video pixels.
+
+    Returns
+    -------
+    bytes
+        Header (``u32`` length, kind 4) followed by ``u8`` tool, ``u8`` r, g, b, a, ``f32`` width.
+    """
+    return VIDEO_HEADER.pack(VIDEO_INK.size + 1, KIND_INK) + VIDEO_INK.pack(tool, *rgba, width)
 
 
 def tilt_degrees(altitude: float, azimuth: float) -> tuple[float, float]:

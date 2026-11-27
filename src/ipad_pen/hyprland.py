@@ -123,6 +123,13 @@ class Hyprland:
                 return m["width"], m["height"]
         raise HyprlandError(f"no active output {name}")
 
+    def output_scale(self, name: str) -> float:
+        """Hyprland scale of an output."""
+        for m in self.monitors():
+            if m["name"] == name and not m.get("disabled"):
+                return float(m["scale"])
+        raise HyprlandError(f"no active output {name}")
+
     def focused_output(self) -> str:
         """Name of the focused output."""
         for m in self.monitors():

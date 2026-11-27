@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 
+from ipad_pen.ink import InkTracker, default_path, watch_ink
 from ipad_pen.protocol import (
     Gesture,
     Hello,
@@ -12,6 +13,7 @@ from ipad_pen.protocol import (
     Zoom,
     encode_video,
     encode_video_config,
+    encode_video_ink,
     encode_video_size,
     read_frame,
 )
@@ -101,11 +103,13 @@ class Display:
         Desk mode: Hyprland scale of the headless output.
     local_ink : bool, optional
         Tell the iPad to draw the current stroke itself until the video shows it.
+    ink_file : Path, optional
+        Saber's ink style file; default ``$XDG_RUNTIME_DIR/saber-ink.json``.
     """
 
     def __init__(self, hypr, connect_video, encoder_argv, mode: str = "lecture", output: str = "auto",
                  max_width: int = 1920, desk_name: str = "IPAD", desk_size: tuple[int, int] = (1366, 1024),
-                 desk_scale: float = 1.0, local_ink: bool = True, fallback_argv=None):
+                 desk_scale: float = 1.0, local_ink: bool = True, fallback_argv=None, ink_file=None):
         if mode not in ("lecture", "desk"):
             raise ValueError(f"unknown mode {mode!r}")
         self.hypr = hypr
@@ -119,6 +123,7 @@ class Display:
         self.desk_size = desk_size
         self.desk_scale = desk_scale
         self.local_ink = local_ink
+        self.ink_file = ink_file
 
     def _prepare(self) -> tuple[str, tuple[int, int], tuple[int, int] | None]:
         """Pick or create the output. Returns (name, picture size, encoder scale size or None)."""
@@ -155,6 +160,7 @@ class Display:
             return
         aspect = mapper.aspect
         watcher = None
+        ink_task = None
         try:
             name, size, scale_to = self._prepare()
             self.hypr.set_tablet_output(name)
@@ -162,6 +168,9 @@ class Display:
             mapper.aspect = None
             writer.write(encode_video_config(self.local_ink))
             writer.write(encode_video_size(*size))
+            if self.local_ink:
+                writer.write(encode_video_ink(0, (0, 0, 0, 0), 0.0))
+            ink_task = self._start_ink(writer, name, size)
 
             async def send(au: bytes) -> None:
                 writer.write(encode_video(au))
@@ -188,11 +197,29 @@ class Display:
         finally:
             mapper.aspect = aspect
             writer.close()
-            if watcher is not None:
-                watcher.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await watcher
+            for task in (watcher, ink_task):
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
             self._teardown()
+
+    def _start_ink(self, writer, name: str, size: tuple[int, int]):
+        """Follow Saber's pen style and send it to the iPad; None if the local ink is off."""
+        path = self.ink_file if self.ink_file is not None else default_path()
+        if not self.local_ink or path is None:
+            return None
+
+        def scale() -> tuple[float, int]:
+            return self.hypr.output_scale(name), self.hypr.output_size(name)[0]
+
+        tracker = InkTracker(path, scale, size[0])
+
+        def send(style) -> None:
+            log.info("ink style: tool %d rgba %s width %.2f video px", style.tool, style.rgba, style.width)
+            writer.write(encode_video_ink(style.tool, style.rgba, style.width))
+
+        return asyncio.create_task(watch_ink(tracker, send))
 
     async def _keep_mapping(self, name: str) -> None:
         """Map the tablet to ``name`` again after every Hyprland config reload.
