@@ -33,8 +33,16 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate, UI
     static let palmGuardSeconds: TimeInterval = 0.4
     private var pencilDown = false
     private var pencilUpTime: TimeInterval = 0
-    private var scrollActive = false
-    private var zoomActive = false
+    // A two-finger gesture is either a scroll or a zoom, never both: whichever
+    // passes its threshold first owns the gesture until the fingers lift.
+    static let scrollLockPoints: CGFloat = 12
+    static let zoomLockLogScale: Double = 0.08
+    private enum FingerMode { case undecided, scroll, zoom }
+    private var fingerMode = FingerMode.undecided
+    private var panLive = false
+    private var pinchLive = false
+    private var pendingPan = CGPoint.zero
+    private var pendingLogScale = 0.0
 
     // False while a stroke that started in the black bars goes on: it is not sent.
     private var strokeInside = true
@@ -376,18 +384,26 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate, UI
     @objc private func handlePan(_ pan: UIPanGestureRecognizer) {
         switch pan.state {
         case .began, .changed:
-            if !scrollActive {
-                scrollActive = true
-                server.send(Wire.gesture(Wire.gestureScroll, phase: Wire.gestureBegin))
-            }
+            panLive = true
             let t = pan.translation(in: view)
             pan.setTranslation(.zero, in: view)
-            server.send(Wire.scroll(dx: Double(t.x), dy: Double(t.y)))
-        case .ended, .cancelled, .failed:
-            if scrollActive {
-                scrollActive = false
-                server.send(Wire.gesture(Wire.gestureScroll, phase: Wire.gestureEnd))
+            switch fingerMode {
+            case .scroll:
+                server.send(Wire.scroll(dx: Double(t.x), dy: Double(t.y)))
+            case .zoom:
+                break
+            case .undecided:
+                pendingPan.x += t.x
+                pendingPan.y += t.y
+                if hypot(pendingPan.x, pendingPan.y) >= PenViewController.scrollLockPoints {
+                    fingerMode = .scroll
+                    server.send(Wire.gesture(Wire.gestureScroll, phase: Wire.gestureBegin))
+                    server.send(Wire.scroll(dx: Double(pendingPan.x), dy: Double(pendingPan.y)))
+                }
             }
+        case .ended, .cancelled, .failed:
+            panLive = false
+            fingersMaybeDone()
         default:
             break
         }
@@ -396,23 +412,45 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate, UI
     @objc private func handlePinch(_ pinch: UIPinchGestureRecognizer) {
         switch pinch.state {
         case .began, .changed:
-            if !zoomActive {
-                zoomActive = true
-                server.send(Wire.gesture(Wire.gestureZoom, phase: Wire.gestureBegin))
-            }
+            pinchLive = true
             let s = pinch.scale
             pinch.scale = 1
-            if s > 0 {
+            guard s > 0 else { return }
+            switch fingerMode {
+            case .zoom:
                 server.send(Wire.zoom(scale: Double(s)))
+            case .scroll:
+                break
+            case .undecided:
+                pendingLogScale += log(Double(s))
+                if abs(pendingLogScale) >= PenViewController.zoomLockLogScale {
+                    fingerMode = .zoom
+                    server.send(Wire.gesture(Wire.gestureZoom, phase: Wire.gestureBegin))
+                    server.send(Wire.zoom(scale: exp(pendingLogScale)))
+                }
             }
         case .ended, .cancelled, .failed:
-            if zoomActive {
-                zoomActive = false
-                server.send(Wire.gesture(Wire.gestureZoom, phase: Wire.gestureEnd))
-            }
+            pinchLive = false
+            fingersMaybeDone()
         default:
             break
         }
+    }
+
+    // Ends the gesture once both recognizers have ended.
+    private func fingersMaybeDone() {
+        guard !panLive && !pinchLive else { return }
+        switch fingerMode {
+        case .scroll:
+            server.send(Wire.gesture(Wire.gestureScroll, phase: Wire.gestureEnd))
+        case .zoom:
+            server.send(Wire.gesture(Wire.gestureZoom, phase: Wire.gestureEnd))
+        case .undecided:
+            break
+        }
+        fingerMode = .undecided
+        pendingPan = .zero
+        pendingLogScale = 0
     }
 
     // MARK: Pencil double tap -> stylus button
