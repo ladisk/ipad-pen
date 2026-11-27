@@ -3,13 +3,22 @@ import Network
 
 // TCP server on the iPad's loopback interface. The laptop reaches it through
 // usbmux (USB cable); it is not reachable over Wi-Fi. One client at a time.
-final class PenServer {
+// Used twice: pen samples (port 27015, iPad sends) and video (port 27016,
+// laptop sends).
+final class LoopbackServer {
     var onStatus: ((String) -> Void)?
     var onConnected: (() -> Void)?
+    var onDisconnected: (() -> Void)?
+    var onReceive: ((Data) -> Void)?
 
+    let port: UInt16
     private var listener: NWListener?
     private var connection: NWConnection?
     private var running = false
+
+    init(port: UInt16) {
+        self.port = port
+    }
 
     var isConnected: Bool { connection != nil }
 
@@ -42,7 +51,7 @@ final class PenServer {
         let params = NWParameters(tls: nil, tcp: tcp)
         params.allowLocalEndpointReuse = true
         params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback),
-                                                           port: NWEndpoint.Port(rawValue: Wire.port)!)
+                                                           port: NWEndpoint.Port(rawValue: port)!)
         let listener: NWListener
         do {
             listener = try NWListener(using: params)
@@ -55,7 +64,7 @@ final class PenServer {
             guard let self = self else { return }
             switch state {
             case .ready:
-                if !self.isConnected { self.onStatus?("Waiting for laptop (USB, port \(Wire.port))") }
+                if !self.isConnected { self.onStatus?("Waiting for laptop (USB, port \(self.port))") }
             case .failed(let error):
                 self.onStatus?("Listener failed: \(error)")
                 listener.cancel()
@@ -103,15 +112,25 @@ final class PenServer {
         conn.start(queue: .main)
     }
 
-    // The laptop sends nothing; reading only detects when it goes away.
+    // Pen port: the laptop sends nothing, reading only detects when it goes
+    // away. Video port: the data goes to onReceive.
     private func receiveLoop(_ conn: NWConnection) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [weak self] _, _, isComplete, error in
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [weak self] data, _, isComplete, error in
+            guard let self = self, self.connection === conn else { return }
+            if let data = data, !data.isEmpty {
+                self.onReceive?(data)
+            }
             if isComplete || error != nil {
-                self?.dropConnection(conn)
+                self.dropConnection(conn)
             } else {
-                self?.receiveLoop(conn)
+                self.receiveLoop(conn)
             }
         }
+    }
+
+    // Close the current client, e.g. after a protocol error.
+    func disconnect() {
+        dropConnection()
     }
 
     private func dropConnection(_ conn: NWConnection? = nil) {
@@ -120,7 +139,8 @@ final class PenServer {
         connection = nil
         current.stateUpdateHandler = nil
         current.cancel()
-        if running { onStatus?("Waiting for laptop (USB, port \(Wire.port))") }
+        onDisconnected?()
+        if running { onStatus?("Waiting for laptop (USB, port \(port))") }
     }
 
     private static func isLoopback(_ endpoint: NWEndpoint) -> Bool {

@@ -1,7 +1,10 @@
 import UIKit
 
 final class PenViewController: UIViewController, UIPencilInteractionDelegate {
-    private let server = PenServer()
+    private let server = LoopbackServer(port: Wire.port)
+    private let videoServer = LoopbackServer(port: Wire.videoPort)
+    private let videoView = VideoView()
+    private lazy var decoder = VideoDecoder(layer: videoView.displayLayer)
     private let statusLabel = UILabel()
     private let trail = CAShapeLayer()
     private let trailPath = UIBezierPath()
@@ -11,6 +14,14 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
         super.viewDidLoad()
         view.backgroundColor = .black
         view.isMultipleTouchEnabled = true
+
+        // Laptop screen, under the pen trail and the status line. Touches go
+        // through to this controller's view.
+        videoView.frame = view.bounds
+        videoView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        videoView.isUserInteractionEnabled = false
+        videoView.isHidden = true
+        view.addSubview(videoView)
 
         trail.strokeColor = UIColor(white: 1.0, alpha: 0.25).cgColor
         trail.fillColor = nil
@@ -37,12 +48,26 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
         server.onStatus = { [weak self] text in self?.statusLabel.text = text }
         server.onConnected = { [weak self] in self?.sendHello() }
 
+        decoder.onFirstFrame = { [weak self] in self?.showVideo(true) }
+        videoServer.onConnected = { [weak self] in self?.decoder.reset() }
+        videoServer.onDisconnected = { [weak self] in
+            self?.decoder.reset()
+            self?.showVideo(false)
+        }
+        videoServer.onReceive = { [weak self] data in
+            guard let self = self else { return }
+            if !self.decoder.receive(data) {
+                self.videoServer.disconnect()
+            }
+        }
+
         let nc = NotificationCenter.default
         nc.addObserver(self, selector: #selector(didEnterBackground),
                        name: UIApplication.didEnterBackgroundNotification, object: nil)
         nc.addObserver(self, selector: #selector(willEnterForeground),
                        name: UIApplication.willEnterForegroundNotification, object: nil)
         server.start()
+        videoServer.start()
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -59,22 +84,44 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
         }
     }
 
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .landscape }
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
     override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { .all }
 
     @objc private func didEnterBackground() {
         server.stop()
+        videoServer.stop()
     }
 
     @objc private func willEnterForeground() {
         server.start()
+        videoServer.start()
     }
 
+    // While the laptop screen is shown, it replaces the local trail and the
+    // status line.
+    private func showVideo(_ on: Bool) {
+        videoView.isHidden = !on
+        trail.isHidden = on
+        statusLabel.isHidden = on
+        if on {
+            trailPath.removeAllPoints()
+            trail.path = nil
+        }
+    }
+
+    // The video fills the whole view with exact pixel mapping, so the laptop
+    // makes its virtual monitor this many pixels (landscape only: w > h).
     private func sendHello() {
         let size = view.bounds.size
         guard size.width > 0, size.height > 0 else { return }
-        server.send(Wire.hello(width: Double(size.width), height: Double(size.height)))
+        var scale = traitCollection.displayScale
+        if scale <= 0 { scale = 2 }
+        let widthPx = UInt16(clamping: Int((size.width * scale).rounded()))
+        let heightPx = UInt16(clamping: Int((size.height * scale).rounded()))
+        server.send(Wire.hello(width: Double(size.width), height: Double(size.height),
+                               widthPx: widthPx, heightPx: heightPx, scale: Double(scale)))
     }
 
     // MARK: Touches (Pencil only; fingers and palm are ignored)

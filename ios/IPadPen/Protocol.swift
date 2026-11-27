@@ -3,7 +3,8 @@ import Foundation
 // Wire format, see PROTOCOL.md. All values little-endian.
 enum Wire {
     static let port: UInt16 = 27015
-    static let version: UInt16 = 1
+    static let videoPort: UInt16 = 27016
+    static let version: UInt16 = 2
 
     static let typeHello: UInt8 = 1
     static let typeSample: UInt8 = 2
@@ -14,13 +15,18 @@ enum Wire {
     static let phaseUp: UInt8 = 2
     static let phaseCancel: UInt8 = 3
 
-    static func hello(width: Double, height: Double) -> Data {
+    // Version 2 hello: view size in points, then in display pixels, and the
+    // scale (pixels per point).
+    static func hello(width: Double, height: Double, widthPx: UInt16, heightPx: UInt16, scale: Double) -> Data {
         var d = Data()
         d.append(typeHello)
         d.append(contentsOf: Array("IPEN".utf8))
         d.appendLE(version)
         d.appendLE(Float(width))
         d.appendLE(Float(height))
+        d.appendLE(widthPx)
+        d.appendLE(heightPx)
+        d.appendLE(Float(scale))
         return d
     }
 
