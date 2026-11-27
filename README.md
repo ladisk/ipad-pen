@@ -147,6 +147,7 @@ Desk mode: put things on `IPAD` like on any other monitor:
 ipad-pen                              # lecture mode, focused output
 ipad-pen --output HDMI-A-1            # lecture mode, this output
 ipad-pen --mode desk [--desk-size 2732x2048]
+ipad-pen --pressure                   # send Pencil pressure (default: constant, so every app draws a constant width)
 ipad-pen --no-display --aspect 16:9   # pen only, mapped to a 16:9 monitor without stretching
 ipad-pen --tcp HOST:PORT              # plain TCP source, for testing without an iPad
 ```

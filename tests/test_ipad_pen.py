@@ -132,7 +132,7 @@ def test_end_to_end_tcp():
         server = await asyncio.start_server(ipad, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
         sink = FakeSink()
-        args = build_parser().parse_args(["--tcp", f"127.0.0.1:{port}", "--once"])
+        args = build_parser().parse_args(["--tcp", f"127.0.0.1:{port}", "--once", "--pressure"])
         async with server:
             await asyncio.wait_for(run(args, sink=sink, hypr=RecordingHyprland()), 5)
         return sink
@@ -435,7 +435,7 @@ def test_v1_hello_stays_pen_only():
 
         server = await asyncio.start_server(ipad, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
-        args = build_parser().parse_args(["--tcp", f"127.0.0.1:{port}", "--once"])
+        args = build_parser().parse_args(["--tcp", f"127.0.0.1:{port}", "--once", "--pressure"])
         async with server:
             await asyncio.wait_for(run(args, sink=FakeSink(), hypr=hypr, encoder_argv=lambda n, s: ["false"]), 5)
 
@@ -564,7 +564,7 @@ def test_ctrl_released_on_disconnect():
 
         server = await asyncio.start_server(ipad, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
-        args = build_parser().parse_args(["--tcp", f"127.0.0.1:{port}", "--once"])
+        args = build_parser().parse_args(["--tcp", f"127.0.0.1:{port}", "--once", "--pressure"])
         async with server:
             await asyncio.wait_for(run(args, sink=FakeSink(), hypr=RecordingHyprland(), wheel_sink=wheel_sink), 5)
 
@@ -613,3 +613,17 @@ def test_display_reapplies_mapping_on_reload():
 
     asyncio.run(scenario())
     assert hypr.calls == [("eval", 'hl.config({ input = { tablet = { output = "DP-1" } } })')]
+
+
+def test_constant_pressure_by_default():
+    from ipad_pen.protocol import PHASE_MOVE
+    from ipad_pen.tablet import PRESSURE_MAX
+
+    sink = FakeSink()
+    m = Mapper(sink)
+    m.handle(Sample(PHASE_MOVE, 0.5, 0.5, 0.2, 1.0, 0.0, 0.0))
+    assert (e.EV_ABS, e.ABS_PRESSURE, PRESSURE_MAX) in sink.frames[-1]
+    sink = FakeSink()
+    m = Mapper(sink, pressure=True)
+    m.handle(Sample(PHASE_MOVE, 0.5, 0.5, 0.2, 1.0, 0.0, 0.0))
+    assert (e.EV_ABS, e.ABS_PRESSURE, round(0.2 * PRESSURE_MAX)) in sink.frames[-1]

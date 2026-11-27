@@ -60,6 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tcp", metavar="HOST:PORT", help="connect to a plain TCP endpoint instead (testing)")
     p.add_argument("--aspect", type=parse_aspect, metavar="W:H",
                    help="pen-only mode: use the centred part of the iPad with this aspect ratio, e.g. 16:9")
+    p.add_argument("--pressure", action="store_true",
+                   help="send the Pencil's pressure (default: constant full pressure, constant line width)")
     p.add_argument("--mode", choices=("lecture", "desk"), default="lecture",
                    help="lecture: mirror a real output (default); desk: the iPad is an extra virtual monitor")
     p.add_argument("--output", default="auto",
@@ -188,7 +190,7 @@ async def run(args: argparse.Namespace, sink=None, hypr=None, encoder_argv=None,
         connect_video = functools.partial(open_usbmux, args.video_port, args.udid)
     display = make_display(args, connect_video, hypr, encoder_argv)
     try:
-        await serve(connect, Mapper(sink, args.aspect), once=args.once, display=display, wheel=wheel)
+        await serve(connect, Mapper(sink, args.aspect, pressure=args.pressure), once=args.once, display=display, wheel=wheel)
     finally:
         loop.remove_signal_handler(signal.SIGTERM)
         if wheel is not None:

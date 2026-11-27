@@ -64,11 +64,15 @@ class Mapper:
         Target width/height ratio. When given, the largest centred part of
         the iPad view with this ratio maps to the full tablet range, so the
         drawing is not stretched on a monitor of this ratio.
+    pressure : bool, optional
+        Send the Pencil's pressure. When False (default), every contact is
+        sent at full pressure, so all apps draw a constant width.
     """
 
-    def __init__(self, sink, aspect: float | None = None):
+    def __init__(self, sink, aspect: float | None = None, pressure: bool = False):
         self.sink = sink
         self.aspect = aspect
+        self.pressure = pressure
         self.view = (4.0, 3.0)
         self.in_prox = False
         self.last_xy = (XY_MAX // 2, XY_MAX // 2)
@@ -108,7 +112,10 @@ class Mapper:
             return
         x, y = self._scale(s.x, s.y)
         tx, ty = tilt_degrees(s.altitude, s.azimuth)
-        pressure = round(min(max(s.pressure, 0.0), 1.0) * PRESSURE_MAX)
+        if self.pressure:
+            pressure = round(min(max(s.pressure, 0.0), 1.0) * PRESSURE_MAX)
+        else:
+            pressure = PRESSURE_MAX
         if s.phase == PHASE_DOWN:
             pressure = max(pressure, 1)  # down must count as contact
         ev = [
