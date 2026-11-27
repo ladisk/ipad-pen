@@ -6,14 +6,22 @@ import struct
 from dataclasses import dataclass
 
 MAGIC = b"IPEN"
-VERSION = 2
-VERSIONS = (1, 2)
+VERSION = 3
+VERSIONS = (1, 2, 3)
 DEFAULT_PORT = 27015
 VIDEO_PORT = 27016
 
 TYPE_HELLO = 1
 TYPE_SAMPLE = 2
 TYPE_BUTTON = 3
+TYPE_GESTURE = 4
+TYPE_SCROLL = 5
+TYPE_ZOOM = 6
+
+GESTURE_SCROLL = 1
+GESTURE_ZOOM = 2
+GESTURE_BEGIN = 0
+GESTURE_END = 1
 
 PHASE_DOWN = 0
 PHASE_MOVE = 1
@@ -24,11 +32,18 @@ PHASE_CANCEL = 3
 HELLO_HEAD = struct.Struct("<B4sH")  # type, magic, version
 HELLO_V1 = struct.Struct("<B4sHff")  # + width_pt, height_pt
 HELLO_V2 = struct.Struct("<B4sHffHHf")  # + width_px, height_px, scale
-HELLO_SIZES = {1: HELLO_V1.size, 2: HELLO_V2.size}
+HELLO_SIZES = {1: HELLO_V1.size, 2: HELLO_V2.size, 3: HELLO_V2.size}
 SAMPLE = struct.Struct("<BBfffffd")  # type, phase, x, y, pressure, altitude, azimuth, t
 BUTTON = struct.Struct("<BBd")  # type, button, t
 
-FRAME_SIZES = {TYPE_SAMPLE: SAMPLE.size, TYPE_BUTTON: BUTTON.size}
+GESTURE = struct.Struct("<BBB")  # type, gesture, phase (version 3)
+SCROLL = struct.Struct("<Bff")  # type, dx, dy in points (version 3)
+ZOOM = struct.Struct("<Bf")  # type, scale factor since the previous zoom frame (version 3)
+
+FRAME_SIZES = {
+    TYPE_SAMPLE: SAMPLE.size, TYPE_BUTTON: BUTTON.size,
+    TYPE_GESTURE: GESTURE.size, TYPE_SCROLL: SCROLL.size, TYPE_ZOOM: ZOOM.size,
+}
 
 # Video connection: u32 length (kind byte + payload), u8 kind, payload.
 VIDEO_HEADER = struct.Struct("<IB")
@@ -120,7 +135,50 @@ class Button:
     timestamp: float
 
 
-Frame = Hello | Sample | Button
+@dataclass(frozen=True)
+class Gesture:
+    """Start or end of a two-finger gesture (version 3).
+
+    Attributes
+    ----------
+    gesture : int
+        ``GESTURE_SCROLL`` or ``GESTURE_ZOOM``.
+    phase : int
+        ``GESTURE_BEGIN`` or ``GESTURE_END`` (also sent when the gesture is cancelled).
+    """
+
+    gesture: int
+    phase: int
+
+
+@dataclass(frozen=True)
+class Scroll:
+    """Two-finger pan since the previous scroll frame (version 3).
+
+    Attributes
+    ----------
+    dx, dy : float
+        Finger movement in iPad points, y down. Content follows the fingers.
+    """
+
+    dx: float
+    dy: float
+
+
+@dataclass(frozen=True)
+class Zoom:
+    """Pinch since the previous zoom frame (version 3).
+
+    Attributes
+    ----------
+    scale : float
+        Factor, 1.0 = no change, above 1 = fingers moved apart (zoom in).
+    """
+
+    scale: float
+
+
+Frame = Hello | Sample | Button | Gesture | Scroll | Zoom
 
 
 def encode(frame: Frame) -> bytes:
@@ -128,7 +186,7 @@ def encode(frame: Frame) -> bytes:
 
     Parameters
     ----------
-    frame : Hello, Sample or Button
+    frame : Hello, Sample, Button, Gesture, Scroll or Zoom
         Frame to encode.
 
     Returns
@@ -148,6 +206,12 @@ def encode(frame: Frame) -> bytes:
         )
     if isinstance(frame, Button):
         return BUTTON.pack(TYPE_BUTTON, frame.button, frame.timestamp)
+    if isinstance(frame, Gesture):
+        return GESTURE.pack(TYPE_GESTURE, frame.gesture, frame.phase)
+    if isinstance(frame, Scroll):
+        return SCROLL.pack(TYPE_SCROLL, frame.dx, frame.dy)
+    if isinstance(frame, Zoom):
+        return ZOOM.pack(TYPE_ZOOM, frame.scale)
     raise TypeError(f"not a frame: {frame!r}")
 
 
@@ -161,7 +225,7 @@ def decode(data: bytes) -> Frame:
 
     Returns
     -------
-    Hello, Sample or Button
+    Hello, Sample, Button, Gesture, Scroll or Zoom
         The decoded frame.
 
     Raises
@@ -183,6 +247,12 @@ def decode(data: bytes) -> Frame:
         return Sample(*SAMPLE.unpack(data)[1:])
     if kind == TYPE_BUTTON:
         return Button(*BUTTON.unpack(data)[1:])
+    if kind == TYPE_GESTURE:
+        return Gesture(*GESTURE.unpack(data)[1:])
+    if kind == TYPE_SCROLL:
+        return Scroll(*SCROLL.unpack(data)[1:])
+    if kind == TYPE_ZOOM:
+        return Zoom(*ZOOM.unpack(data)[1:])
     raise ProtocolError(f"unknown frame type {kind}")
 
 
@@ -196,7 +266,7 @@ async def read_frame(reader) -> Frame | None:
 
     Returns
     -------
-    Hello, Sample, Button or None
+    Hello, Sample, Button, Gesture, Scroll, Zoom or None
         The frame, or None at a clean end of stream.
     """
     head = await reader.read(1)

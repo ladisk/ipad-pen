@@ -4,11 +4,19 @@ import Foundation
 enum Wire {
     static let port: UInt16 = 27015
     static let videoPort: UInt16 = 27016
-    static let version: UInt16 = 2
+    static let version: UInt16 = 3
 
     static let typeHello: UInt8 = 1
     static let typeSample: UInt8 = 2
     static let typeButton: UInt8 = 3
+    static let typeGesture: UInt8 = 4
+    static let typeScroll: UInt8 = 5
+    static let typeZoom: UInt8 = 6
+
+    static let gestureScroll: UInt8 = 1
+    static let gestureZoom: UInt8 = 2
+    static let gestureBegin: UInt8 = 0
+    static let gestureEnd: UInt8 = 1
 
     static let phaseDown: UInt8 = 0
     static let phaseMove: UInt8 = 1
@@ -41,6 +49,32 @@ enum Wire {
         d.appendLE(Float(altitude))
         d.appendLE(Float(azimuth))
         d.appendLE(timestamp)
+        return d
+    }
+
+    // Two-finger gesture start or end (version 3).
+    static func gesture(_ gesture: UInt8, phase: UInt8) -> Data {
+        var d = Data()
+        d.append(typeGesture)
+        d.append(gesture)
+        d.append(phase)
+        return d
+    }
+
+    // Two-finger pan since the previous scroll frame, in points, y down.
+    static func scroll(dx: Double, dy: Double) -> Data {
+        var d = Data()
+        d.append(typeScroll)
+        d.appendLE(Float(dx))
+        d.appendLE(Float(dy))
+        return d
+    }
+
+    // Pinch factor since the previous zoom frame (1 = no change).
+    static func zoom(scale: Double) -> Data {
+        var d = Data()
+        d.append(typeZoom)
+        d.appendLE(Float(scale))
         return d
     }
 

@@ -3,6 +3,7 @@ import json
 import math
 import os
 import shutil
+import struct
 import subprocess
 
 import pytest
@@ -12,6 +13,11 @@ from ipad_pen.cli import build_parser, make_display, run
 from ipad_pen.hyprland import Hyprland, right_edge
 from ipad_pen.protocol import (
     CONFIG_LOCAL_INK,
+    GESTURE,
+    GESTURE_BEGIN,
+    GESTURE_END,
+    GESTURE_SCROLL,
+    GESTURE_ZOOM,
     HELLO_V1,
     HELLO_V2,
     KIND_AU,
@@ -22,11 +28,16 @@ from ipad_pen.protocol import (
     PHASE_MOVE,
     PHASE_UP,
     SAMPLE,
+    SCROLL,
     VIDEO_SIZE,
+    ZOOM,
     Button,
+    Gesture,
     Hello,
     ProtocolError,
     Sample,
+    Scroll,
+    Zoom,
     decode,
     encode,
     encode_video,
@@ -37,6 +48,8 @@ from ipad_pen.protocol import (
 )
 from ipad_pen.tablet import PRESSURE_MAX, XY_MAX, Mapper
 from ipad_pen.video import FlvParser, fit_size, nal_types, wf_recorder_argv
+from ipad_pen.wheel import CAPABILITIES as WHEEL_CAPS
+from ipad_pen.wheel import WheelMapper
 
 
 class FakeSink:
@@ -69,7 +82,7 @@ def test_bad_frames():
     with pytest.raises(ProtocolError):
         decode(bytes(bad))
     future = bytearray(encode(Hello(2, 1.0, 1.0)))
-    future[5:7] = (3).to_bytes(2, "little")
+    future[5:7] = (4).to_bytes(2, "little")
     with pytest.raises(ProtocolError):
         decode(bytes(future))
 
@@ -250,9 +263,14 @@ class RecordingHyprland(Hyprland):
     def __init__(self):
         super().__init__()
         self.calls = []
+        self.reload_callbacks = []
         self.outputs = [{"name": "DP-1", "width": 3840, "height": 2160, "x": 4608, "y": 0, "scale": 1.25,
                          "focused": True},
                         {"name": "HDMI-A-1", "width": 1920, "height": 1080, "x": 0, "y": 0, "scale": 1}]
+
+    async def watch_reload(self, callback, delay=0.3):
+        self.reload_callbacks.append(callback)
+        await asyncio.Event().wait()
 
     def _run(self, *args):
         self.calls.append(args)
@@ -396,3 +414,175 @@ def test_v1_hello_stays_pen_only():
 
     asyncio.run(scenario())
     assert hypr.calls == []
+
+
+# --- two-finger gestures (protocol version 3) ---------------------------------
+
+def test_gesture_frames_roundtrip():
+    frames = (Gesture(GESTURE_SCROLL, GESTURE_BEGIN), Gesture(GESTURE_ZOOM, GESTURE_END),
+              Scroll(-3.5, 12.25), Zoom(1.5), Hello(3, 1366.0, 1024.0, 2732, 2048, 2.0))
+    for f in frames:
+        assert decode(encode(f)) == f
+    assert (GESTURE.size, SCROLL.size, ZOOM.size) == (3, 9, 5)
+    assert encode(Scroll(1.0, 2.0)) == bytes([5]) + struct.pack("<ff", 1.0, 2.0)
+    assert Hello(3, 1.0, 1.0, 2, 2, 2.0).has_display
+
+
+def test_gesture_frames_stream():
+    data = b"".join(encode(f) for f in (Hello(3, 1366.0, 1024.0, 2732, 2048, 2.0), Scroll(1, 2), Zoom(1.1)))
+
+    async def read_all():
+        r = _reader(data)
+        return [await read_frame(r) for _ in range(4)]
+
+    got = asyncio.run(read_all())
+    assert got[1:3] == [Scroll(1, 2), Zoom(pytest.approx(1.1, rel=1e-6))] and got[3] is None
+
+
+def wheel_events(sink, code):
+    return [v for t, c, v in sink.events() if t == e.EV_REL and c == code]
+
+
+def test_wheel_device_capabilities():
+    assert {e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL, e.REL_WHEEL_HI_RES, e.REL_HWHEEL_HI_RES} <= set(
+        WHEEL_CAPS[e.EV_REL])
+    assert {e.BTN_LEFT, e.KEY_LEFTCTRL} <= set(WHEEL_CAPS[e.EV_KEY])
+
+
+def test_scroll_direction_and_accumulation():
+    sink = FakeSink()
+    w = WheelMapper(sink, scroll_gain=7.5)
+    # 1 pt = 7.5 units: ten steps of 1 pt give 75 hi-res units, remainders carried
+    for _ in range(10):
+        w.handle(Scroll(0.0, 1.0))
+    assert sum(wheel_events(sink, e.REL_WHEEL_HI_RES)) == 75  # fingers down = wheel up
+    assert wheel_events(sink, e.REL_WHEEL) == []  # no full detent yet
+    for _ in range(6):
+        w.handle(Scroll(0.0, 1.0))  # 120 units in total
+    assert sum(wheel_events(sink, e.REL_WHEEL_HI_RES)) == 120
+    assert wheel_events(sink, e.REL_WHEEL) == [1]
+    w.handle(Scroll(2.0, 0.0))  # fingers right = view left
+    assert sum(wheel_events(sink, e.REL_HWHEEL_HI_RES)) == -15
+    w.handle(Scroll(0.0, -32.0))  # 240 units up/down: two detents the other way
+    assert wheel_events(sink, e.REL_WHEEL) == [1, -2]
+    assert sink.frames and all(len(f) <= 4 for f in sink.frames)
+
+
+def test_scroll_ignores_garbage_and_inverts():
+    sink = FakeSink()
+    w = WheelMapper(sink, scroll_gain=-10.0)
+    w.handle(Scroll(math.nan, 1.0))
+    assert sink.frames == []
+    w.handle(Scroll(0.0, 3.0))
+    assert wheel_events(sink, e.REL_WHEEL_HI_RES) == [-30]
+
+
+def keys(sink):
+    return [(c, v) for t, c, v in sink.events() if t == e.EV_KEY]
+
+
+def test_pinch_holds_ctrl_and_releases():
+    sink = FakeSink()
+    w = WheelMapper(sink, pinch_gain=1000.0)
+    w.handle(Gesture(GESTURE_ZOOM, GESTURE_BEGIN))
+    assert keys(sink) == [(e.KEY_LEFTCTRL, 1)] and w.ctrl_down
+    w.handle(Zoom(math.exp(0.1)))
+    w.handle(Zoom(math.exp(-0.05)))
+    w.handle(Scroll(0.0, 50.0))  # drift during the pinch: ignored
+    assert wheel_events(sink, e.REL_WHEEL_HI_RES) == [100, -49]  # remainder carried
+    assert wheel_events(sink, e.REL_HWHEEL_HI_RES) == []
+    w.handle(Gesture(GESTURE_ZOOM, GESTURE_END))
+    assert keys(sink) == [(e.KEY_LEFTCTRL, 1), (e.KEY_LEFTCTRL, 0)] and not w.ctrl_down
+    w.release()  # idempotent
+    assert len(keys(sink)) == 2
+    w.handle(Scroll(0.0, 4.0))  # scrolling works again
+    assert wheel_events(sink, e.REL_WHEEL_HI_RES)[-1] == 32
+
+
+def test_zoom_without_begin_presses_ctrl_and_release_works():
+    sink = FakeSink()
+    w = WheelMapper(sink)
+    w.handle(Zoom(2.0))
+    assert w.ctrl_down
+    w.release()
+    assert keys(sink) == [(e.KEY_LEFTCTRL, 1), (e.KEY_LEFTCTRL, 0)]
+
+
+def test_ctrl_released_on_error():
+    class BrokenSink(FakeSink):
+        def emit(self, events):
+            if any(t == e.EV_REL for t, _, _ in events):
+                raise OSError("device gone")
+            super().emit(events)
+
+    sink = BrokenSink()
+    w = WheelMapper(sink, pinch_gain=1000.0)
+    w.handle(Gesture(GESTURE_ZOOM, GESTURE_BEGIN))
+    with pytest.raises(OSError):
+        w.handle(Zoom(2.0))
+    assert not w.ctrl_down and keys(sink) == [(e.KEY_LEFTCTRL, 1), (e.KEY_LEFTCTRL, 0)]
+
+
+def test_ctrl_released_on_disconnect():
+    """The iPad drops the connection in the middle of a pinch."""
+    wheel_sink = FakeSink()
+
+    async def scenario():
+        async def ipad(reader, writer):
+            writer.write(encode(Hello(3, 1366.0, 1024.0)))
+            writer.write(encode(Gesture(GESTURE_ZOOM, GESTURE_BEGIN)))
+            writer.write(encode(Zoom(1.2)))
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(ipad, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        args = build_parser().parse_args(["--tcp", f"127.0.0.1:{port}", "--once"])
+        async with server:
+            await asyncio.wait_for(run(args, sink=FakeSink(), hypr=RecordingHyprland(), wheel_sink=wheel_sink), 5)
+
+    asyncio.run(scenario())
+    assert keys(wheel_sink) == [(e.KEY_LEFTCTRL, 1), (e.KEY_LEFTCTRL, 0)]
+    assert wheel_events(wheel_sink, e.REL_WHEEL_HI_RES) == [round(math.log(1.2) * 1000)]
+
+
+# --- Hyprland config reload ---------------------------------------------------
+
+def test_watch_reload(tmp_path):
+    sock = str(tmp_path / ".socket2.sock")
+    called = []
+
+    async def scenario():
+        async def events(reader, writer):
+            writer.write(b"workspace>>1\nconfigreloaded>>\nfocusedmon>>DP-1,1\nconfigreloaded>>\n")
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_unix_server(events, sock)
+        async with server:
+            await asyncio.wait_for(Hyprland(event_socket=sock).watch_reload(lambda: called.append(1), delay=0), 5)
+
+    asyncio.run(scenario())
+    assert called == [1, 1]
+
+
+def test_watch_reload_missing_socket(tmp_path, caplog):
+    h = Hyprland(event_socket=str(tmp_path / "none.sock"))
+    asyncio.run(asyncio.wait_for(h.watch_reload(lambda: 1 / 0), 5))  # returns, no exception
+    assert "cannot open the Hyprland event socket" in caplog.text
+
+
+def test_display_reapplies_mapping_on_reload():
+    from ipad_pen.daemon import Display
+
+    hypr = RecordingHyprland()
+    display = Display(hypr, None, None)
+
+    async def scenario():
+        task = asyncio.create_task(display._keep_mapping("DP-1"))
+        await asyncio.sleep(0)
+        hypr.reload_callbacks[0]()
+        task.cancel()
+
+    asyncio.run(scenario())
+    assert hypr.calls == [("eval", 'hl.config({ input = { tablet = { output = "DP-1" } } })')]

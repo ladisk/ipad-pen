@@ -1,7 +1,9 @@
 """Create the iPad's virtual monitor in Hyprland and map the tablet to it."""
 
+import asyncio
 import json
 import logging
+import os
 import re
 import subprocess
 
@@ -45,10 +47,13 @@ class Hyprland:
     ----------
     hyprctl : str, optional
         hyprctl executable.
+    event_socket : str, optional
+        Path of Hyprland's event socket; default is derived from the environment.
     """
 
-    def __init__(self, hyprctl: str = "hyprctl"):
+    def __init__(self, hyprctl: str = "hyprctl", event_socket: str | None = None):
         self.hyprctl = hyprctl
+        self.event_socket = event_socket
 
     def _run(self, *args: str) -> str:
         try:
@@ -140,3 +145,49 @@ class Hyprland:
     def eval(self, lua: str) -> None:
         """Run Lua in the Hyprland config (``hyprctl eval``)."""
         self._ok("eval", lua)
+
+    def event_socket_path(self) -> str | None:
+        """Path of ``.socket2.sock`` of the running Hyprland, or None if unknown."""
+        if self.event_socket:
+            return self.event_socket
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        if not runtime or not signature:
+            return None
+        return f"{runtime}/hypr/{signature}/.socket2.sock"
+
+    async def watch_reload(self, callback, delay: float = 0.3) -> None:
+        """Call ``callback()`` after every ``configreloaded`` event until cancelled.
+
+        Reads Hyprland's event socket (a local Unix socket). If the socket is
+        missing or closes, logs once and returns; the caller keeps working.
+
+        Parameters
+        ----------
+        callback : callable
+            Called without arguments in a worker thread (it may run ``hyprctl``).
+        delay : float, optional
+            Seconds to wait after the event, so the reload is finished.
+        """
+        path = self.event_socket_path()
+        if path is None:
+            log.warning("no Hyprland event socket (XDG_RUNTIME_DIR or HYPRLAND_INSTANCE_SIGNATURE unset); "
+                        "the tablet mapping is not restored after a config reload")
+            return
+        try:
+            reader, writer = await asyncio.open_unix_connection(path)
+        except OSError as exc:
+            log.warning("cannot open the Hyprland event socket %s (%s); "
+                        "the tablet mapping is not restored after a config reload", path, exc)
+            return
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    log.warning("Hyprland event socket closed")
+                    return
+                if line.startswith(b"configreloaded>>"):
+                    await asyncio.sleep(delay)
+                    await asyncio.to_thread(callback)
+        finally:
+            writer.close()

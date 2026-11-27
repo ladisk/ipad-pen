@@ -1,7 +1,7 @@
 import AVFoundation
 import UIKit
 
-final class PenViewController: UIViewController, UIPencilInteractionDelegate {
+final class PenViewController: UIViewController, UIPencilInteractionDelegate, UIGestureRecognizerDelegate {
     // Local ink: how long a finished stroke stays before it fades out (the
     // real stroke has arrived in the video by then), and the fade time.
     static let localInkHoldMs = 300
@@ -27,6 +27,14 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
     private let inkContainer = CALayer()
     private var inkStroke: CAShapeLayer?
     private let inkPath = UIBezierPath()
+
+    // Two-finger gestures. They stay off while the Pencil is down and for a
+    // moment after, because a resting palm can look like two fingers.
+    static let palmGuardSeconds: TimeInterval = 0.4
+    private var pencilDown = false
+    private var pencilUpTime: TimeInterval = 0
+    private var scrollActive = false
+    private var zoomActive = false
 
     // False while a stroke that started in the black bars goes on: it is not sent.
     private var strokeInside = true
@@ -64,6 +72,22 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
             statusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             statusLabel.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -24),
         ])
+
+        // Fingers: two-finger pan = scroll, pinch = zoom. Direct touches only, so
+        // the Pencil never reaches the recognizers. One finger does nothing.
+        let direct = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        pan.minimumNumberOfTouches = 2
+        pan.maximumNumberOfTouches = 2
+        pan.allowedTouchTypes = direct
+        pan.cancelsTouchesInView = false
+        pan.delegate = self
+        view.addGestureRecognizer(pan)
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        pinch.allowedTouchTypes = direct
+        pinch.cancelsTouchesInView = false
+        pinch.delegate = self
+        view.addGestureRecognizer(pinch)
 
         let pencil = UIPencilInteraction()
         pencil.delegate = self
@@ -257,10 +281,11 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
         }
     }
 
-    // MARK: Touches (Pencil only; fingers and palm are ignored)
+    // MARK: Touches (Pencil only; fingers and palm are ignored here, two fingers are gestures below)
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         for touch in touches where touch.type == .pencil {
+            pencilDown = true
             send(touch, phase: Wire.phaseDown)
             if videoShown {
                 if strokeInside { inkBegin(touch) }
@@ -292,6 +317,8 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         for touch in touches where touch.type == .pencil {
+            pencilDown = false
+            pencilUpTime = ProcessInfo.processInfo.systemUptime
             send(touch, phase: Wire.phaseUp)
             inkEnd(touch, cancelled: false)
         }
@@ -299,6 +326,8 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         for touch in touches where touch.type == .pencil {
+            pencilDown = false
+            pencilUpTime = ProcessInfo.processInfo.systemUptime
             send(touch, phase: Wire.phaseCancel)
             inkEnd(touch, cancelled: true)
         }
@@ -326,6 +355,64 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
                                 altitude: Double(touch.altitudeAngle),
                                 azimuth: Double(touch.azimuthAngle(in: view)),
                                 timestamp: touch.timestamp))
+    }
+
+    // MARK: Two-finger gestures
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        let sincePencil = ProcessInfo.processInfo.systemUptime - pencilUpTime
+        return !pencilDown && sincePencil > PenViewController.palmGuardSeconds
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        return true
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        return touch.type != .pencil
+    }
+
+    @objc private func handlePan(_ pan: UIPanGestureRecognizer) {
+        switch pan.state {
+        case .began, .changed:
+            if !scrollActive {
+                scrollActive = true
+                server.send(Wire.gesture(Wire.gestureScroll, phase: Wire.gestureBegin))
+            }
+            let t = pan.translation(in: view)
+            pan.setTranslation(.zero, in: view)
+            server.send(Wire.scroll(dx: Double(t.x), dy: Double(t.y)))
+        case .ended, .cancelled, .failed:
+            if scrollActive {
+                scrollActive = false
+                server.send(Wire.gesture(Wire.gestureScroll, phase: Wire.gestureEnd))
+            }
+        default:
+            break
+        }
+    }
+
+    @objc private func handlePinch(_ pinch: UIPinchGestureRecognizer) {
+        switch pinch.state {
+        case .began, .changed:
+            if !zoomActive {
+                zoomActive = true
+                server.send(Wire.gesture(Wire.gestureZoom, phase: Wire.gestureBegin))
+            }
+            let s = pinch.scale
+            pinch.scale = 1
+            if s > 0 {
+                server.send(Wire.zoom(scale: Double(s)))
+            }
+        case .ended, .cancelled, .failed:
+            if zoomActive {
+                zoomActive = false
+                server.send(Wire.gesture(Wire.gestureZoom, phase: Wire.gestureEnd))
+            }
+        default:
+            break
+        }
     }
 
     // MARK: Pencil double tap -> stylus button

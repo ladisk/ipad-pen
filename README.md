@@ -112,8 +112,8 @@ laptop: the laptop connects out to the iPad.
    (Hyprland 0.56 with the Lua config: `hyprctl keyword` does not work). Do
    not map the device `ipad-pen` to a fixed monitor with `hl.device(...)`: a
    per-device `output` wins over the global one. A config reload
-   (`hyprctl reload`) resets the mapping to `current`; unplug and plug in the
-   iPad to set it again.
+   (`hyprctl reload`) resets the mapping to `current`; the daemon listens to
+   Hyprland's event socket and sets its mapping again after each reload.
 
 ## Usage
 
@@ -152,6 +152,15 @@ the centred 16:9 part of the iPad. Other options: `--bitrate`,
 `--video-port`, `--recorder` (`ipad-pen --help`). For the service, put the
 options in `ExecStart` in `~/.config/systemd/user/ipad-pen.service`. Logs:
 `journalctl --user -u ipad-pen -f` (`-v` adds the encoder output).
+
+Fingers: one finger and palms are ignored. Two fingers scroll (the content
+follows the fingers, both directions) and pinch zooms (Ctrl + wheel). The
+daemon makes a second virtual device, "iPad Pen Scroll" (wheel only), for
+this; the scroll goes to the window under the pointer. Tune with
+`--scroll-gain` (wheel units per iPad point, 120 = one detent; negative
+inverts), `--pinch-gain` (wheel units per unit of ln(scale)), or turn it off
+with `--no-gestures`. Ctrl is released at the end of the pinch and when the
+connection ends.
 
 Events: `ABS_X`/`ABS_Y` (0..32767), `ABS_PRESSURE` (0..4095),
 `ABS_TILT_X`/`ABS_TILT_Y` (-90..90 deg), `BTN_TOOL_PEN`, `BTN_TOUCH`,

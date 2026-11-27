@@ -1,4 +1,4 @@
-# iPad Pen protocol, version 2
+# iPad Pen protocol, version 3
 
 The iPad app listens on two TCP ports on its loopback address (127.0.0.1).
 The laptop connects to both through usbmux (the USB channel). Each port
@@ -23,14 +23,15 @@ Sent when a client connects, and again when the view size changes.
 |--------|--------|----------------------------------------------|
 | 0      | u8     | type = 1                                     |
 | 1      | 4 byte | magic `IPEN`                                 |
-| 5      | u16    | protocol version (1 or 2)                    |
+| 5      | u16    | protocol version (1, 2 or 3)                 |
 | 7      | f32    | view width in points                         |
 | 11     | f32    | view height in points                        |
 | 15     | u16    | view width in display pixels (version 2)     |
 | 17     | u16    | view height in display pixels (version 2)    |
 | 19     | f32    | scale, display pixels per point (version 2)  |
 
-Version 1 is 15 bytes (`struct.Struct("<B4sHff")`), version 2 is 23 bytes
+Version 3 has the layout of version 2 and adds the finger gesture frames
+(types 4 to 6, below). Version 1 is 15 bytes (`struct.Struct("<B4sHff")`), version 2 is 23 bytes
 (`struct.Struct("<B4sHffHHf")`). The app is landscape only, so width > height
 (2732 x 2048 px, scale 2 on the 12.9" iPad Pro).
 
@@ -62,6 +63,31 @@ A momentary button press. Button 0 is the Pencil double tap.
 | 2      | f64  | timestamp, iPad uptime in s |
 
 Python: `struct.Struct("<BBd")`.
+
+## Finger gestures (version 3)
+
+One finger and palms are ignored. Two fingers on the glass are a gesture:
+pan = scroll, pinch = zoom (the two can run at the same time). The app does
+not start a gesture while the Pencil is down or within 0.4 s after it lifts.
+Frames of types 4 to 6 are sent on the pen connection, only after a version 3
+hello.
+
+Gesture (type 4, 3 bytes, `struct.Struct("<BBB")`): `u8` type = 4, `u8`
+gesture (1 scroll, 2 zoom), `u8` phase (0 begin, 1 end; end also covers a
+cancelled gesture). Begin and end are sent once per gesture.
+
+Scroll (type 5, 9 bytes, `struct.Struct("<Bff")`): `f32` dx, `f32` dy, the
+finger movement in iPad points since the previous scroll frame, y down. The
+content follows the fingers (natural direction).
+
+Zoom (type 6, 5 bytes, `struct.Struct("<Bf")`): `f32` scale, the factor since
+the previous zoom frame. 1 = no change, above 1 = the fingers move apart.
+Factors multiply, so `ln(scale)` adds up.
+
+The laptop turns scroll into wheel events on a second virtual device ("iPad
+Pen Scroll") and a pinch into Ctrl + wheel. While a zoom is active it ignores
+scroll frames. It releases Ctrl at the end of the zoom gesture, when the
+session ends and when it stops.
 
 ## Video connection (port 27016)
 
@@ -105,5 +131,9 @@ real stroke has arrived in the video. The laptop turns it off with flags = 0.
 A receiver drops the connection on an unknown type or an unknown version.
 A new frame type or a changed layout needs a new version number.
 
-The laptop accepts version 1 and 2 hellos. With a version 1 hello (an old
-app) it does not open the video connection and works as a pen tablet only.
+The laptop accepts version 1, 2 and 3 hellos. Daemon and app are updated
+together: an old daemon drops a version 3 hello, and a version 2 app never
+sends gesture frames. The pen frames (types 1 to 3) did not change.
+
+With a version 1 hello (an old app) the laptop does not open the video
+connection and works as a pen tablet only.

@@ -4,7 +4,17 @@ import asyncio
 import contextlib
 import logging
 
-from ipad_pen.protocol import Hello, ProtocolError, encode_video, encode_video_config, encode_video_size, read_frame
+from ipad_pen.protocol import (
+    Gesture,
+    Hello,
+    ProtocolError,
+    Scroll,
+    Zoom,
+    encode_video,
+    encode_video_config,
+    encode_video_size,
+    read_frame,
+)
 from ipad_pen.tablet import Mapper
 from ipad_pen.video import fit_size, stream_encoder
 
@@ -141,9 +151,11 @@ class Display:
             log.info("no video connection (%s); pen only", exc)
             return
         aspect = mapper.aspect
+        watcher = None
         try:
             name, size, scale_to = self._prepare()
             self.hypr.set_tablet_output(name)
+            watcher = asyncio.create_task(self._keep_mapping(name))
             mapper.aspect = None
             writer.write(encode_video_config(self.local_ink))
             writer.write(encode_video_size(*size))
@@ -171,7 +183,26 @@ class Display:
         finally:
             mapper.aspect = aspect
             writer.close()
+            if watcher is not None:
+                watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await watcher
             self._teardown()
+
+    async def _keep_mapping(self, name: str) -> None:
+        """Map the tablet to ``name`` again after every Hyprland config reload.
+
+        A reload resets ``input.tablet.output`` to the value in the user's config.
+        """
+
+        def reapply() -> None:
+            try:
+                self.hypr.set_tablet_output(name)
+                log.info("Hyprland reloaded its config; tablet mapped to %s again", name)
+            except Exception as exc:  # noqa: BLE001 - keep watching
+                log.warning("could not map the tablet again: %s", exc)
+
+        await self.hypr.watch_reload(reapply)
 
     def _teardown(self) -> None:
         steps = [lambda: self.hypr.set_tablet_output("current")]
@@ -194,7 +225,7 @@ async def _run_display(display: Display, hello: Hello, mapper: Mapper) -> None:
         log.error("display mode failed: %s", exc)
 
 
-async def run_session(reader, mapper: Mapper, display: Display | None = None) -> None:
+async def run_session(reader, mapper: Mapper, display: Display | None = None, wheel=None) -> None:
     """Read frames until the iPad closes the connection.
 
     Parameters
@@ -205,6 +236,8 @@ async def run_session(reader, mapper: Mapper, display: Display | None = None) ->
         Receives every frame.
     display : Display, optional
         Started on the first version 2 hello; None means pen only.
+    wheel : WheelMapper, optional
+        Receives the two-finger gesture frames; None ignores them.
     """
     display_task = None
     try:
@@ -217,16 +250,23 @@ async def run_session(reader, mapper: Mapper, display: Display | None = None) ->
                          frame.width_px, frame.height_px, frame.version)
                 if display is not None and display_task is None and frame.has_display:
                     display_task = asyncio.create_task(_run_display(display, frame, mapper))
-            mapper.handle(frame)
+            if isinstance(frame, (Gesture, Scroll, Zoom)):
+                if wheel is not None:
+                    wheel.handle(frame)
+            else:
+                mapper.handle(frame)
     finally:
         mapper.lift()
+        if wheel is not None:
+            wheel.release()
         if display_task is not None:
             display_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await display_task
 
 
-async def serve(connect, mapper: Mapper, once: bool = False, display: Display | None = None) -> None:
+async def serve(connect, mapper: Mapper, once: bool = False, display: Display | None = None,
+                wheel=None) -> None:
     """Connect, run a session, and reconnect with backoff forever.
 
     Parameters
@@ -239,6 +279,8 @@ async def serve(connect, mapper: Mapper, once: bool = False, display: Display | 
         Return after the first session (used by tests).
     display : Display, optional
         Virtual monitor for version 2 iPads; None means pen only.
+    wheel : WheelMapper, optional
+        Scroll and zoom from two-finger gestures; None ignores them.
     """
     delay = 0.5
     while True:
@@ -254,7 +296,7 @@ async def serve(connect, mapper: Mapper, once: bool = False, display: Display | 
         log.info("connected")
         delay = 0.5
         try:
-            await run_session(reader, mapper, display)
+            await run_session(reader, mapper, display, wheel)
         except (ProtocolError, asyncio.IncompleteReadError, ConnectionError) as exc:
             log.warning("session ended: %s", exc)
         finally:
