@@ -1,6 +1,6 @@
 [project]
 name = "ipad-pen"
-version = "0.1.0"
+version = "0.2.0"
 description = "Use an iPad and Apple Pencil as a USB pen tablet on Linux"
 authors = [
     { name = "Klemen Zaletelj", email = "zaletelj.klemen@gmail.com" }

@@ -4,10 +4,15 @@ import argparse
 import asyncio
 import functools
 import logging
+import shutil
+import signal
 
-from ipad_pen.daemon import open_tcp, open_usbmux, serve
-from ipad_pen.protocol import DEFAULT_PORT
+from ipad_pen.daemon import Display, open_tcp, open_usbmux, serve
+from ipad_pen.protocol import DEFAULT_PORT, VIDEO_PORT
 from ipad_pen.tablet import Mapper
+from ipad_pen.video import find_render_node, wf_recorder_argv
+
+log = logging.getLogger("ipad_pen")
 
 
 def parse_aspect(text: str) -> float:
@@ -36,13 +41,49 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"app port on the iPad (default {DEFAULT_PORT})")
     p.add_argument("--tcp", metavar="HOST:PORT", help="connect to a plain TCP endpoint instead (testing)")
     p.add_argument("--aspect", type=parse_aspect, metavar="W:H",
-                   help="use the centred part of the iPad with this aspect ratio, e.g. 16:9")
+                   help="pen-only mode: use the centred part of the iPad with this aspect ratio, e.g. 16:9")
+    p.add_argument("--no-display", action="store_true", help="pen only: no virtual monitor on the iPad")
+    p.add_argument("--video-port", type=int, default=VIDEO_PORT, help=f"video port on the iPad (default {VIDEO_PORT})")
+    p.add_argument("--output-name", default="IPAD", help="name of the virtual monitor (default IPAD)")
+    p.add_argument("--bitrate", type=float, default=20.0, help="video bit rate in Mbit/s (default 20)")
+    p.add_argument("--render-node", help="VAAPI device (default: the Intel GPU)")
+    p.add_argument("--recorder", default="wf-recorder", help="wf-recorder executable")
     p.add_argument("--once", action="store_true", help="exit after the first connection ends")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
 
-async def run(args: argparse.Namespace, sink=None) -> None:
+def make_display(args: argparse.Namespace, connect_video, hypr=None, encoder_argv=None) -> Display | None:
+    """Build the display mode, or None for pen only.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed command line.
+    connect_video : coroutine function
+        Opens the video connection.
+    hypr : Hyprland, optional
+        Default is a real ``Hyprland``.
+    encoder_argv : callable, optional
+        ``encoder_argv(output_name)``; default runs wf-recorder with VAAPI.
+    """
+    if args.no_display:
+        return None
+    if encoder_argv is None:
+        if shutil.which(args.recorder) is None:
+            log.error("%s not found; pen only (install it: sudo pacman -S wf-recorder)", args.recorder)
+            return None
+        node = args.render_node or find_render_node()
+        encoder_argv = functools.partial(wf_recorder_argv, render_node=node, bitrate_mbit=args.bitrate,
+                                         program=args.recorder)
+    if hypr is None:
+        from ipad_pen.hyprland import Hyprland
+
+        hypr = Hyprland()
+    return Display(hypr, connect_video, encoder_argv, args.output_name)
+
+
+async def run(args: argparse.Namespace, sink=None, hypr=None, encoder_argv=None) -> None:
     """Run the daemon.
 
     Parameters
@@ -51,7 +92,15 @@ async def run(args: argparse.Namespace, sink=None) -> None:
         Parsed command line.
     sink : object, optional
         Event sink; default is a new ``UInputSink``.
+    hypr : Hyprland, optional
+        For tests; default is a real ``Hyprland``.
+    encoder_argv : callable, optional
+        For tests; default runs wf-recorder.
     """
+    # SIGTERM (systemctl stop) cancels the main task, so the virtual monitor is removed.
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+    loop.add_signal_handler(signal.SIGTERM, main_task.cancel)
     own_sink = sink is None
     if own_sink:
         from ipad_pen.tablet import UInputSink
@@ -60,11 +109,15 @@ async def run(args: argparse.Namespace, sink=None) -> None:
     if args.tcp:
         host, port = args.tcp.rsplit(":", 1)
         connect = functools.partial(open_tcp, host, int(port))
+        connect_video = functools.partial(open_tcp, host, args.video_port)
     else:
         connect = functools.partial(open_usbmux, args.port, args.udid)
+        connect_video = functools.partial(open_usbmux, args.video_port, args.udid)
+    display = make_display(args, connect_video, hypr, encoder_argv)
     try:
-        await serve(connect, Mapper(sink, args.aspect), once=args.once)
+        await serve(connect, Mapper(sink, args.aspect), once=args.once, display=display)
     finally:
+        loop.remove_signal_handler(signal.SIGTERM)
         if own_sink:
             sink.close()
 
@@ -76,5 +129,5 @@ def main(argv: list[str] | None = None) -> None:
                         format="%(asctime)s %(levelname)s %(message)s")
     try:
         asyncio.run(run(args))
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
