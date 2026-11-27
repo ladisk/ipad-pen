@@ -1,6 +1,6 @@
 name: iOS release
 
-# Builds the iPad app unsigned and publishes it as a GitHub release.
+# Builds the iPad app unsigned and publishes it as a GitHub release (manual).
 # Start it with:
 #   gh workflow run ios-release.yml -R ladisk/ipad-pen
 
