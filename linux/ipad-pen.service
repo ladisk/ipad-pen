@@ -1,0 +1,12 @@
+[Unit]
+Description=iPad Pen tablet daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/ipad-pen
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

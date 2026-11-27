@@ -1,0 +1,68 @@
+name: iOS release
+
+# Builds the iPad app unsigned and publishes it as a GitHub release.
+# Start it with:
+#   gh workflow run ios-release.yml -R ladisk/ipad-pen
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-release
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.3.app
+          xcodebuild -runFirstLaunch
+          xcodebuild -downloadPlatform iOS -version 26.3
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Build without code signing
+        working-directory: ios
+        run: |
+          xcodebuild -project IPadPen.xcodeproj -scheme IPadPen \
+            -sdk iphoneos -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        id: package
+        run: |
+          version=$(sed -n 's/^ *MARKETING_VERSION: *"\(.*\)"/\1/p' ios/project.yml)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          mkdir -p Payload dist
+          cp -R ios/build/Build/Products/Release-iphoneos/IPadPen.app Payload/
+          zip -qr "dist/IPadPen_${version}_unsigned.ipa" Payload
+          ls -la dist
+
+      - name: Create GitHub release
+        run: |
+          tag="v${VERSION}.${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" dist/*.ipa \
+            --target "$GITHUB_SHA" \
+            --title "iPad Pen $tag" \
+            --notes "Unsigned build of ${GITHUB_SHA::8}. Sign and install it with your own Apple ID."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.package.outputs.version }}
