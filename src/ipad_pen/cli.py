@@ -10,7 +10,7 @@ import signal
 from ipad_pen.daemon import Display, open_tcp, open_usbmux, serve
 from ipad_pen.protocol import DEFAULT_PORT, VIDEO_PORT
 from ipad_pen.tablet import Mapper
-from ipad_pen.video import find_render_node, wf_recorder_argv
+from ipad_pen.video import find_render_node, gsr_argv, wf_recorder_argv
 from ipad_pen.wheel import PINCH_GAIN, SCROLL_GAIN, WheelMapper
 
 log = logging.getLogger("ipad_pen")
@@ -83,6 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bitrate", type=float, default=20.0, help="video bit rate in Mbit/s (default 20)")
     p.add_argument("--render-node", help="VAAPI device (default: the Intel GPU)")
     p.add_argument("--recorder", default="wf-recorder", help="wf-recorder executable")
+    p.add_argument("--capture", choices=("gpu-screen-recorder", "wf-recorder"), default="gpu-screen-recorder",
+                   help="lecture mode capture program (default gpu-screen-recorder: light for Hyprland; "
+                        "falls back to wf-recorder if missing or failing). Desk mode always uses wf-recorder")
+    p.add_argument("--gsr", default="gpu-screen-recorder", help="gpu-screen-recorder executable")
     p.add_argument("--once", action="store_true", help="exit after the first connection ends")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
@@ -104,15 +108,29 @@ def make_display(args: argparse.Namespace, connect_video, hypr=None, encoder_arg
     """
     if args.no_display:
         return None
+    fallback_argv = None
     if encoder_argv is None:
-        if shutil.which(args.recorder) is None:
+        use_gsr = args.capture == "gpu-screen-recorder" and args.mode == "lecture"
+        if use_gsr and shutil.which(args.gsr) is None:
+            log.warning("%s not found; using wf-recorder", args.gsr)
+            use_gsr = False
+        if not use_gsr and shutil.which(args.recorder) is None:
             log.error("%s not found; pen only (install it: sudo pacman -S wf-recorder)", args.recorder)
             return None
         node = args.render_node or find_render_node()
 
-        def encoder_argv(output: str, size: tuple[int, int] | None) -> list[str]:
+        def wf_argv(output: str, size: tuple[int, int] | None) -> list[str]:
             return wf_recorder_argv(output, render_node=node, bitrate_mbit=args.bitrate, program=args.recorder,
                                     size=size)
+
+        if use_gsr:
+            def encoder_argv(output: str, size: tuple[int, int] | None) -> list[str]:
+                return gsr_argv(output, bitrate_mbit=args.bitrate, size=size, program=args.gsr)
+
+            if shutil.which(args.recorder) is not None:
+                fallback_argv = wf_argv
+        else:
+            encoder_argv = wf_argv
     if hypr is None:
         from ipad_pen.hyprland import Hyprland
 
@@ -120,7 +138,7 @@ def make_display(args: argparse.Namespace, connect_video, hypr=None, encoder_arg
     desk_scale = args.desk_scale or max(1.0, round(args.desk_size[0] / 1366 * 4) / 4)
     return Display(hypr, connect_video, encoder_argv, mode=args.mode, output=args.output,
                    max_width=args.max_width, desk_name=args.desk_name, desk_size=args.desk_size,
-                   desk_scale=desk_scale, local_ink=not args.no_local_ink)
+                   desk_scale=desk_scale, local_ink=not args.no_local_ink, fallback_argv=fallback_argv)
 
 
 async def run(args: argparse.Namespace, sink=None, hypr=None, encoder_argv=None, wheel_sink=None) -> None:

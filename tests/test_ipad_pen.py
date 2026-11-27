@@ -47,7 +47,7 @@ from ipad_pen.protocol import (
     tilt_degrees,
 )
 from ipad_pen.tablet import PRESSURE_MAX, XY_MAX, Mapper
-from ipad_pen.video import FlvParser, fit_size, nal_types, wf_recorder_argv
+from ipad_pen.video import FlvParser, fit_size, gsr_argv, nal_types, stream_encoder, wf_recorder_argv
 from ipad_pen.wheel import CAPABILITIES as WHEEL_CAPS
 from ipad_pen.wheel import WheelMapper
 
@@ -209,6 +209,33 @@ def test_wf_recorder_argv():
     assert "-F" not in argv
     scaled = wf_recorder_argv("DP-1", size=(1920, 1080))
     assert scaled[scaled.index("-F") + 1] == "scale_vaapi=w=1920:h=1080:format=nv12:out_range=full"
+
+
+def test_gsr_argv():
+    argv = gsr_argv("DP-6", 20, (1920, 1080))
+    assert argv[:3] == ["gpu-screen-recorder", "-w", "DP-6"]
+    opt = {argv[i]: argv[i + 1] for i in range(1, len(argv) - 1, 2)}
+    assert (opt["-c"], opt["-k"], opt["-f"], opt["-fm"], opt["-bm"], opt["-q"]) == (
+        "flv", "h264", "60", "cfr", "cbr", "20000")
+    assert (opt["-keyint"], opt["-cursor"], opt["-s"]) == ("1", "no", "1920x1080")
+    assert argv[-2:] == ["-o", "/dev/stdout"]
+    assert "-s" not in gsr_argv("eDP-1")
+
+
+@needs_ffmpeg
+def test_stream_encoder_fallback():
+    got = []
+
+    async def send(au):
+        got.append(au)
+
+    async def go():
+        await stream_encoder(["false"], send, fallback_argv=ffmpeg_flv_argv(10))
+
+    # the failing encoder exits at once, the fallback runs, then it also ends and the quick-fail limit stops us
+    with pytest.raises(RuntimeError):
+        asyncio.run(asyncio.wait_for(go(), 20))
+    assert len(got) >= 10
 
 
 def test_fit_size():

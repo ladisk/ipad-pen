@@ -31,7 +31,7 @@ When the iPad connects, the daemon:
      screen) named `IPAD`, 1366x1024 at 60 Hz, scale 1, right of the
      rightmost monitor (`--desk-size 2732x2048` is sharper, scale 2);
 2. maps the tablet to that output (`input.tablet.output`);
-3. starts `wf-recorder`, which captures the output and encodes it with the
+3. starts the capture program, which captures the output and encodes it with the
    Intel GPU (VAAPI H.264, 20 Mbit/s constant bit rate, no B-frames, a
    keyframe every 60 pictures). In lecture mode the GPU scales the picture to
    at most 1920 px wide (`--max-width`). Every picture goes to the iPad on a
@@ -85,9 +85,15 @@ laptop: the laptop connects out to the iPad.
    sudo pacman -S wf-recorder
    ```
 
-   Without it the daemon works as a pen tablet only. gpu-screen-recorder is
-   not used: it captures through KMS (the kernel display API), which does not
-   see the Hyprland headless output of desk mode.
+   Without it the daemon works as a pen tablet only. Lecture mode uses
+   gpu-screen-recorder when it is installed (`--capture wf-recorder` turns
+   that off). It reads the screen through KMS (the kernel display API), so
+   Hyprland does not copy every frame; wf-recorder's per-frame copy kept
+   Hyprland near 100 % of one core. gpu-screen-recorder cannot see the
+   headless output of desk mode, so desk mode always uses wf-recorder. If
+   gpu-screen-recorder is missing or exits at once, the daemon logs it and
+   uses wf-recorder. Its command: `-c flv -k h264 -f 60 -fm cfr -bm cbr
+   -q 20000 -keyint 1 -cursor no -s WxH` (no pointer in the iPad picture).
 
 3. Install the daemon and start it as a user service:
 

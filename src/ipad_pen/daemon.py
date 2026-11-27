@@ -84,6 +84,8 @@ class Display:
     encoder_argv : callable
         ``encoder_argv(output_name, size)`` returns the encoder command (FLV on
         stdout); ``size`` is the picture size to scale to, or None.
+    fallback_argv : callable, optional
+        Same signature; the encoder to use when ``encoder_argv`` exits at once.
     mode : str, optional
         ``"lecture"`` or ``"desk"``.
     output : str, optional
@@ -103,12 +105,13 @@ class Display:
 
     def __init__(self, hypr, connect_video, encoder_argv, mode: str = "lecture", output: str = "auto",
                  max_width: int = 1920, desk_name: str = "IPAD", desk_size: tuple[int, int] = (1366, 1024),
-                 desk_scale: float = 1.0, local_ink: bool = True):
+                 desk_scale: float = 1.0, local_ink: bool = True, fallback_argv=None):
         if mode not in ("lecture", "desk"):
             raise ValueError(f"unknown mode {mode!r}")
         self.hypr = hypr
         self.connect_video = connect_video
         self.encoder_argv = encoder_argv
+        self.fallback_argv = fallback_argv
         self.mode = mode
         self.output = output
         self.max_width = max_width
@@ -168,7 +171,9 @@ class Display:
                 while await reader.read(4096):
                     pass
 
-            stream = asyncio.create_task(stream_encoder(self.encoder_argv(name, scale_to), send))
+            fallback = self.fallback_argv(name, scale_to) if self.fallback_argv else None
+            stream = asyncio.create_task(
+                stream_encoder(self.encoder_argv(name, scale_to), send, fallback_argv=fallback))
             closed = asyncio.create_task(ipad_closed())
             try:
                 done, _ = await asyncio.wait({stream, closed}, return_when=asyncio.FIRST_COMPLETED)

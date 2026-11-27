@@ -1,7 +1,8 @@
 """Capture a Hyprland output, encode it to H.264 and cut it into access units.
 
-wf-recorder captures the output (wlr-screencopy, so it also works for a
-headless output) and encodes it with VAAPI. It writes FLV to a pipe: every FLV
+wf-recorder (wlr-screencopy, so it also works for a headless output) or
+gpu-screen-recorder (KMS, real outputs only, much lighter for Hyprland)
+captures the output and encodes it with VAAPI. Both write FLV to a pipe: every FLV
 tag holds exactly one encoded frame, so the daemon gets complete access units
 without waiting for the next frame's start code.
 """
@@ -102,6 +103,41 @@ def wf_recorder_argv(output: str, render_node: str | None = None, bitrate_mbit: 
     for opt in ("bf=0", f"g={gop}", "rc_mode=CBR", f"b={rate}", f"maxrate={rate}", "profile=high"):
         argv += ["-p", opt]
     return argv + ["-m", "flv", "-f", "pipe:1"]
+
+
+def gsr_argv(output: str, bitrate_mbit: float = 20.0, size: tuple[int, int] | None = None, fps: int = 60,
+             program: str = "gpu-screen-recorder") -> list[str]:
+    """Command that captures ``output`` through KMS and writes low-latency H.264 in FLV to stdout.
+
+    gpu-screen-recorder reads the scanout buffer directly, so Hyprland does no
+    per-frame copy. It sees real outputs only, not headless ones. It picks
+    the GPU that drives the output. Constant frame rate keeps frames and
+    keyframes (every 1 s, with SPS/PPS) coming on a still picture; B-frames
+    are off in its H.264 encoder.
+
+    Parameters
+    ----------
+    output : str
+        Hyprland output name (``--list-capture-options`` names it).
+    bitrate_mbit : float, optional
+        Constant bit rate in Mbit/s.
+    size : (int, int), optional
+        Scale the picture down to fit this size; default is the output's size.
+    fps : int, optional
+        Frame rate.
+    program : str, optional
+        gpu-screen-recorder executable.
+
+    Returns
+    -------
+    list of str
+        The argv.
+    """
+    argv = [program, "-w", output, "-c", "flv", "-k", "h264", "-f", str(fps), "-fm", "cfr",
+            "-bm", "cbr", "-q", str(round(bitrate_mbit * 1000)), "-keyint", "1", "-cursor", "no"]
+    if size:
+        argv += ["-s", f"{size[0]}x{size[1]}"]
+    return argv + ["-o", "/dev/stdout"]
 
 
 def nal_types(au: bytes) -> list[int]:
@@ -235,7 +271,8 @@ async def _stop(proc) -> None:
         await proc.wait()
 
 
-async def stream_encoder(argv: list[str], send, max_quick_fails: int = 3) -> None:
+async def stream_encoder(argv: list[str], send, max_quick_fails: int = 3,
+                         fallback_argv: list[str] | None = None) -> None:
     """Run the encoder and pass its access units to ``send``, restarting it if it dies.
 
     Every (re)start begins with SPS/PPS/IDR, so the iPad decoder recovers.
@@ -249,6 +286,8 @@ async def stream_encoder(argv: list[str], send, max_quick_fails: int = 3) -> Non
         Called with every access unit (Annex-B bytes).
     max_quick_fails : int, optional
         Give up after this many exits in a row within 3 s of the start.
+    fallback_argv : list of str, optional
+        Another encoder command; used from the first exit within 3 s of the start.
     """
     fails = 0
     while True:
@@ -270,6 +309,10 @@ async def stream_encoder(argv: list[str], send, max_quick_fails: int = 3) -> Non
             err_task.cancel()
         log.warning("encoder exited with code %s", proc.returncode)
         fails = fails + 1 if time.monotonic() - started < 3.0 else 1
+        if fallback_argv and time.monotonic() - started < 3.0:
+            log.warning("encoder %s failed at start; using %s instead", argv[0], fallback_argv[0])
+            argv, fallback_argv, fails = fallback_argv, None, 0
+            continue
         if fails >= max_quick_fails:
             raise RuntimeError("encoder keeps failing; run with -v to see its output")
         await asyncio.sleep(1.0)
