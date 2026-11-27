@@ -30,8 +30,14 @@ BUTTON = struct.Struct("<BBd")  # type, button, t
 
 FRAME_SIZES = {TYPE_SAMPLE: SAMPLE.size, TYPE_BUTTON: BUTTON.size}
 
-# Video connection: u32 length + one H.264 access unit (Annex-B).
-VIDEO_HEADER = struct.Struct("<I")
+# Video connection: u32 length (kind byte + payload), u8 kind, payload.
+VIDEO_HEADER = struct.Struct("<IB")
+VIDEO_SIZE = struct.Struct("<HH")  # picture width, height in pixels
+KIND_SIZE = 1
+KIND_AU = 2
+KIND_CONFIG = 3
+VIDEO_CONFIG = struct.Struct("<B")  # flags
+CONFIG_LOCAL_INK = 0x01
 MAX_VIDEO_FRAME = 16 << 20
 
 
@@ -224,13 +230,46 @@ def encode_video(au: bytes) -> bytes:
     Returns
     -------
     bytes
-        ``u32`` little-endian length followed by the access unit.
+        Header (``u32`` length, kind 2) followed by the access unit.
     """
-    return VIDEO_HEADER.pack(len(au)) + au
+    return VIDEO_HEADER.pack(len(au) + 1, KIND_AU) + au
 
 
-async def read_video_frame(reader) -> bytes | None:
-    """Read one framed access unit from the video connection.
+def encode_video_size(width: int, height: int) -> bytes:
+    """Frame the picture size message (sent before the first access unit).
+
+    Parameters
+    ----------
+    width, height : int
+        Picture size in pixels.
+
+    Returns
+    -------
+    bytes
+        Header (``u32`` length, kind 1) followed by ``u16`` width and height.
+    """
+    return VIDEO_HEADER.pack(VIDEO_SIZE.size + 1, KIND_SIZE) + VIDEO_SIZE.pack(width, height)
+
+
+def encode_video_config(local_ink: bool = True) -> bytes:
+    """Frame the config message (sent once, first, after the video connection opens).
+
+    Parameters
+    ----------
+    local_ink : bool, optional
+        The iPad draws the current stroke itself until the video shows it.
+
+    Returns
+    -------
+    bytes
+        Header (``u32`` length, kind 3) followed by the ``u8`` flags.
+    """
+    flags = CONFIG_LOCAL_INK if local_ink else 0
+    return VIDEO_HEADER.pack(VIDEO_CONFIG.size + 1, KIND_CONFIG) + VIDEO_CONFIG.pack(flags)
+
+
+async def read_video_frame(reader) -> tuple[int, bytes] | None:
+    """Read one message from the video connection.
 
     Parameters
     ----------
@@ -239,13 +278,13 @@ async def read_video_frame(reader) -> bytes | None:
 
     Returns
     -------
-    bytes or None
-        The access unit, or None at a clean end of stream.
+    (int, bytes) or None
+        ``(kind, payload)``, or None at a clean end of stream.
 
     Raises
     ------
     ProtocolError
-        If the length is zero or larger than ``MAX_VIDEO_FRAME``.
+        If the length is out of range or the kind is unknown.
     """
     try:
         head = await reader.readexactly(VIDEO_HEADER.size)
@@ -253,10 +292,12 @@ async def read_video_frame(reader) -> bytes | None:
         if not exc.partial:
             return None
         raise
-    (size,) = VIDEO_HEADER.unpack(head)
-    if size == 0 or size > MAX_VIDEO_FRAME:
+    size, kind = VIDEO_HEADER.unpack(head)
+    if size < 2 or size > MAX_VIDEO_FRAME:
         raise ProtocolError(f"bad video frame length {size}")
-    return await reader.readexactly(size)
+    if kind not in (KIND_SIZE, KIND_AU, KIND_CONFIG):
+        raise ProtocolError(f"unknown video message kind {kind}")
+    return kind, await reader.readexactly(size - 1)
 
 
 def tilt_degrees(altitude: float, azimuth: float) -> tuple[float, float]:

@@ -98,6 +98,33 @@ class Hyprland:
                   f'position = "{pos}", scale = {scale:g} }})')
         return pos
 
+    def output_size(self, name: str) -> tuple[int, int]:
+        """Size of an output in pixels as captured (rotation applied).
+
+        Parameters
+        ----------
+        name : str
+            Output name.
+
+        Returns
+        -------
+        (int, int)
+            Width and height in pixels.
+        """
+        for m in self.monitors():
+            if m["name"] == name and not m.get("disabled"):
+                if m.get("transform", 0) % 2:
+                    return m["height"], m["width"]
+                return m["width"], m["height"]
+        raise HyprlandError(f"no active output {name}")
+
+    def focused_output(self) -> str:
+        """Name of the focused output."""
+        for m in self.monitors():
+            if m.get("focused") and not m.get("disabled"):
+                return m["name"]
+        raise HyprlandError("no focused output")
+
     def remove_output(self, name: str) -> None:
         """Remove an output created with ``create_output``; a missing one is not an error."""
         out = self._run("output", "remove", name)

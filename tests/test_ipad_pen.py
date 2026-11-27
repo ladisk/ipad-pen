@@ -8,16 +8,21 @@ import subprocess
 import pytest
 from evdev import ecodes as e
 
-from ipad_pen.cli import build_parser, run
+from ipad_pen.cli import build_parser, make_display, run
 from ipad_pen.hyprland import Hyprland, right_edge
 from ipad_pen.protocol import (
+    CONFIG_LOCAL_INK,
     HELLO_V1,
     HELLO_V2,
+    KIND_AU,
+    KIND_CONFIG,
+    KIND_SIZE,
     MAX_VIDEO_FRAME,
     PHASE_DOWN,
     PHASE_MOVE,
     PHASE_UP,
     SAMPLE,
+    VIDEO_SIZE,
     Button,
     Hello,
     ProtocolError,
@@ -25,12 +30,13 @@ from ipad_pen.protocol import (
     decode,
     encode,
     encode_video,
+    encode_video_size,
     read_frame,
     read_video_frame,
     tilt_degrees,
 )
 from ipad_pen.tablet import PRESSURE_MAX, XY_MAX, Mapper
-from ipad_pen.video import FlvParser, nal_types, wf_recorder_argv
+from ipad_pen.video import FlvParser, fit_size, nal_types, wf_recorder_argv
 
 
 class FakeSink:
@@ -167,11 +173,15 @@ def test_video_framing():
         return out
 
     aus = [b"\x00\x00\x00\x01\x67abc", b"x" * 70000]
-    data = b"".join(encode_video(a) for a in aus)
-    assert data[:4] == (8).to_bytes(4, "little")
-    assert asyncio.run(read_all(data)) == aus
+    data = encode_video_size(1920, 1080) + b"".join(encode_video(a) for a in aus)
+    assert data[:9] == bytes([5, 0, 0, 0, KIND_SIZE, 0x80, 0x07, 0x38, 0x04])
+    assert data[9:14] == bytes([9, 0, 0, 0, KIND_AU])
+    msgs = asyncio.run(read_all(data))
+    assert msgs == [(KIND_SIZE, VIDEO_SIZE.pack(1920, 1080))] + [(KIND_AU, a) for a in aus]
     with pytest.raises(ProtocolError):
-        asyncio.run(read_all((MAX_VIDEO_FRAME + 1).to_bytes(4, "little")))
+        asyncio.run(read_all((MAX_VIDEO_FRAME + 1).to_bytes(4, "little") + bytes([KIND_AU])))
+    with pytest.raises(ProtocolError):
+        asyncio.run(read_all(bytes([2, 0, 0, 0, 9, 0])))  # unknown kind
     with pytest.raises(asyncio.IncompleteReadError):
         asyncio.run(read_all(data[:-1]))
 
@@ -183,6 +193,17 @@ def test_wf_recorder_argv():
     for opt in ("bf=0", "g=60", "rc_mode=CBR", "b=20M"):
         assert opt in argv
     assert argv[-4:] == ["-m", "flv", "-f", "pipe:1"]
+    assert "-F" not in argv
+    scaled = wf_recorder_argv("DP-1", size=(1920, 1080))
+    assert scaled[scaled.index("-F") + 1] == "scale_vaapi=w=1920:h=1080:format=nv12:out_range=full"
+
+
+def test_fit_size():
+    assert fit_size(3840, 2160, 1920) == (1920, 1080)
+    assert fit_size(1920, 1200, 1920) == (1920, 1200)
+    assert fit_size(2560, 1600, 1920) == (1920, 1200)
+    assert fit_size(3440, 1440, 1920) == (1920, 804)
+    assert fit_size(1366, 768, 1920) == (1366, 768)
 
 
 def ffmpeg_flv_argv(frames: int | None = None) -> list[str]:
@@ -229,7 +250,9 @@ class RecordingHyprland(Hyprland):
     def __init__(self):
         super().__init__()
         self.calls = []
-        self.outputs = [{"name": "DP-1", "width": 3840, "height": 2160, "x": 4608, "y": 0, "scale": 1.25}]
+        self.outputs = [{"name": "DP-1", "width": 3840, "height": 2160, "x": 4608, "y": 0, "scale": 1.25,
+                         "focused": True},
+                        {"name": "HDMI-A-1", "width": 1920, "height": 1080, "x": 0, "y": 0, "scale": 1}]
 
     def _run(self, *args):
         self.calls.append(args)
@@ -258,23 +281,20 @@ def test_hyprland_calls():
         h.set_tablet_output('x" }) os.execute("rm')
 
 
-@needs_ffmpeg
-def test_display_end_to_end():
-    """Fake iPad on two ports: pen hello v2, then an H.264 stream must arrive on the video port."""
-    hypr = RecordingHyprland()
-    got = {}
+def run_display(extra_args: list[str], hypr) -> dict:
+    """Fake iPad on two ports: pen hello v2, then collect the video messages."""
+    got = {"msgs": []}
 
     async def scenario():
         video_done = asyncio.Event()
 
         async def video(reader, writer):
-            got["aus"] = []
             try:
-                while len(got["aus"]) < 5:
-                    au = await read_video_frame(reader)
-                    if au is None:
+                while len(got["msgs"]) < 7:  # config + size + 5 access units
+                    msg = await read_video_frame(reader)
+                    if msg is None:
                         break
-                    got["aus"].append(au)
+                    got["msgs"].append(msg)
                 got["tablet"] = [c for c in hypr.calls if c[0] == "eval" and "tablet" in c[1]]
             finally:
                 video_done.set()
@@ -286,31 +306,77 @@ def test_display_end_to_end():
             await asyncio.wait_for(video_done.wait(), 10)
             writer.close()
 
+        def encoder(name, size):
+            got["encoder"] = (name, size)
+            return ffmpeg_flv_argv()
+
         vserver = await asyncio.start_server(video, "127.0.0.1", 0)
         pserver = await asyncio.start_server(pen, "127.0.0.1", 0)
         vport = vserver.sockets[0].getsockname()[1]
         pport = pserver.sockets[0].getsockname()[1]
         args = build_parser().parse_args(["--tcp", f"127.0.0.1:{pport}", "--video-port", str(vport), "--once",
-                                          "--aspect", "16:9"])
+                                          "--aspect", "16:9", *extra_args])
         async with vserver, pserver:
             t0 = asyncio.get_running_loop().time()
-            await asyncio.wait_for(run(args, sink=FakeSink(), hypr=hypr,
-                                       encoder_argv=lambda name: ffmpeg_flv_argv()), 15)
+            await asyncio.wait_for(run(args, sink=FakeSink(), hypr=hypr, encoder_argv=encoder), 15)
             got["elapsed"] = asyncio.get_running_loop().time() - t0
 
     asyncio.run(scenario())
-    aus = got["aus"]
-    assert len(aus) == 5 and got["elapsed"] < 10
-    types = nal_types(aus[0])
+    msgs = got["msgs"]
+    assert len(msgs) == 7 and got["elapsed"] < 10
+    got["config"] = msgs.pop(0)
+    assert all(kind == KIND_AU for kind, _ in msgs[1:])
+    types = nal_types(msgs[1][1])
     assert types[:2] == [7, 8] and 5 in types  # SPS, PPS, IDR first
-    assert got["tablet"] == [("eval", 'hl.config({ input = { tablet = { output = "IPAD" } } })')]
-    cmds = [c for c in hypr.calls if c[0] != "monitors"]
-    assert cmds[0] == ("output", "create", "headless", "IPAD")
-    assert cmds[-2:] == [("eval", 'hl.config({ input = { tablet = { output = "current" } } })'),
-                         ("output", "remove", "IPAD")]
-    assert not hypr.outputs[1:]
     # the encoder was stopped: pytest has no child process left
     assert subprocess.run(["pgrep", "-P", str(os.getpid())], check=False, capture_output=True).returncode == 1
+    return got
+
+
+@needs_ffmpeg
+def test_lecture_mode_end_to_end():
+    hypr = RecordingHyprland()
+    got = run_display([], hypr)  # default: lecture mode, focused output
+    assert got["config"] == (KIND_CONFIG, bytes([CONFIG_LOCAL_INK]))
+    assert got["msgs"][0] == (KIND_SIZE, VIDEO_SIZE.pack(1920, 1080))
+    assert got["encoder"] == ("DP-1", (1920, 1080))  # 4K scaled down
+    assert got["tablet"] == [("eval", 'hl.config({ input = { tablet = { output = "DP-1" } } })')]
+    cmds = [c for c in hypr.calls if c[0] != "monitors"]
+    assert cmds[-1] == ("eval", 'hl.config({ input = { tablet = { output = "current" } } })')
+    assert not any(c[0] == "output" for c in cmds)  # no headless output
+
+
+@needs_ffmpeg
+def test_lecture_mode_named_output():
+    hypr = RecordingHyprland()
+    got = run_display(["--output", "HDMI-A-1", "--no-local-ink"], hypr)
+    assert got["config"] == (KIND_CONFIG, bytes([0]))
+    assert got["encoder"] == ("HDMI-A-1", None)  # 1920 wide: no scaling
+    assert got["msgs"][0] == (KIND_SIZE, VIDEO_SIZE.pack(1920, 1080))
+    assert got["tablet"] == [("eval", 'hl.config({ input = { tablet = { output = "HDMI-A-1" } } })')]
+
+
+@needs_ffmpeg
+def test_desk_mode_end_to_end():
+    hypr = RecordingHyprland()
+    got = run_display(["--mode", "desk"], hypr)
+    assert got["msgs"][0] == (KIND_SIZE, VIDEO_SIZE.pack(1366, 1024))
+    assert got["encoder"] == ("IPAD", None)
+    assert got["tablet"] == [("eval", 'hl.config({ input = { tablet = { output = "IPAD" } } })')]
+    cmds = [c for c in hypr.calls if c[0] != "monitors"]
+    assert cmds[:2] == [
+        ("output", "create", "headless", "IPAD"),
+        ("eval", 'hl.monitor({ output = "IPAD", mode = "1366x1024@60", position = "7680x0", scale = 1 })'),
+    ]
+    assert cmds[-2:] == [("eval", 'hl.config({ input = { tablet = { output = "current" } } })'),
+                         ("output", "remove", "IPAD")]
+    assert [m["name"] for m in hypr.outputs] == ["DP-1", "HDMI-A-1"]
+
+
+def test_desk_scale_default():
+    args = build_parser().parse_args(["--mode", "desk", "--desk-size", "2732x2048"])
+    display = make_display(args, None, hypr=RecordingHyprland(), encoder_argv=lambda n, s: [])
+    assert display.desk_size == (2732, 2048) and display.desk_scale == 2.0
 
 
 def test_v1_hello_stays_pen_only():
@@ -326,7 +392,7 @@ def test_v1_hello_stays_pen_only():
         port = server.sockets[0].getsockname()[1]
         args = build_parser().parse_args(["--tcp", f"127.0.0.1:{port}", "--once"])
         async with server:
-            await asyncio.wait_for(run(args, sink=FakeSink(), hypr=hypr, encoder_argv=lambda n: ["false"]), 5)
+            await asyncio.wait_for(run(args, sink=FakeSink(), hypr=hypr, encoder_argv=lambda n, s: ["false"]), 5)
 
     asyncio.run(scenario())
     assert hypr.calls == []

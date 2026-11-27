@@ -34,6 +34,23 @@ def parse_aspect(text: str) -> float:
     return float(text)
 
 
+def parse_size(text: str) -> tuple[int, int]:
+    """Parse ``WxH`` (for example ``2732x2048``).
+
+    Parameters
+    ----------
+    text : str
+        Size as ``WxH``.
+
+    Returns
+    -------
+    (int, int)
+        Width and height.
+    """
+    w, h = text.lower().split("x", 1)
+    return int(w), int(h)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser."""
     p = argparse.ArgumentParser(prog="ipad-pen", description="iPad + Apple Pencil as a USB pen tablet.")
@@ -42,9 +59,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tcp", metavar="HOST:PORT", help="connect to a plain TCP endpoint instead (testing)")
     p.add_argument("--aspect", type=parse_aspect, metavar="W:H",
                    help="pen-only mode: use the centred part of the iPad with this aspect ratio, e.g. 16:9")
-    p.add_argument("--no-display", action="store_true", help="pen only: no virtual monitor on the iPad")
+    p.add_argument("--mode", choices=("lecture", "desk"), default="lecture",
+                   help="lecture: mirror a real output (default); desk: the iPad is an extra virtual monitor")
+    p.add_argument("--output", default="auto",
+                   help="lecture mode: output to mirror (default auto = the focused output when the iPad connects)")
+    p.add_argument("--max-width", type=int, default=1920, help="lecture mode: scale the picture to at most this width")
+    p.add_argument("--desk-size", type=parse_size, default=(1366, 1024), metavar="WxH",
+                   help="desk mode: virtual monitor size (default 1366x1024; 2732x2048 is sharp)")
+    p.add_argument("--desk-scale", type=float,
+                   help="desk mode: monitor scale (default: width / 1366, so the layout stays 1366x1024)")
+    p.add_argument("--desk-name", default="IPAD", help="desk mode: name of the virtual monitor (default IPAD)")
+    p.add_argument("--no-display", action="store_true", help="pen only: no video on the iPad")
+    p.add_argument("--no-local-ink", action="store_true",
+                   help="the iPad does not draw the current stroke itself (only the video shows it)")
     p.add_argument("--video-port", type=int, default=VIDEO_PORT, help=f"video port on the iPad (default {VIDEO_PORT})")
-    p.add_argument("--output-name", default="IPAD", help="name of the virtual monitor (default IPAD)")
     p.add_argument("--bitrate", type=float, default=20.0, help="video bit rate in Mbit/s (default 20)")
     p.add_argument("--render-node", help="VAAPI device (default: the Intel GPU)")
     p.add_argument("--recorder", default="wf-recorder", help="wf-recorder executable")
@@ -65,7 +93,7 @@ def make_display(args: argparse.Namespace, connect_video, hypr=None, encoder_arg
     hypr : Hyprland, optional
         Default is a real ``Hyprland``.
     encoder_argv : callable, optional
-        ``encoder_argv(output_name)``; default runs wf-recorder with VAAPI.
+        ``encoder_argv(output_name, size)``; default runs wf-recorder with VAAPI.
     """
     if args.no_display:
         return None
@@ -74,13 +102,18 @@ def make_display(args: argparse.Namespace, connect_video, hypr=None, encoder_arg
             log.error("%s not found; pen only (install it: sudo pacman -S wf-recorder)", args.recorder)
             return None
         node = args.render_node or find_render_node()
-        encoder_argv = functools.partial(wf_recorder_argv, render_node=node, bitrate_mbit=args.bitrate,
-                                         program=args.recorder)
+
+        def encoder_argv(output: str, size: tuple[int, int] | None) -> list[str]:
+            return wf_recorder_argv(output, render_node=node, bitrate_mbit=args.bitrate, program=args.recorder,
+                                    size=size)
     if hypr is None:
         from ipad_pen.hyprland import Hyprland
 
         hypr = Hyprland()
-    return Display(hypr, connect_video, encoder_argv, args.output_name)
+    desk_scale = args.desk_scale or max(1.0, round(args.desk_size[0] / 1366 * 4) / 4)
+    return Display(hypr, connect_video, encoder_argv, mode=args.mode, output=args.output,
+                   max_width=args.max_width, desk_name=args.desk_name, desk_size=args.desk_size,
+                   desk_scale=desk_scale, local_ink=not args.no_local_ink)
 
 
 async def run(args: argparse.Namespace, sink=None, hypr=None, encoder_argv=None) -> None:

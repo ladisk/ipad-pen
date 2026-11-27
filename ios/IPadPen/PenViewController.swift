@@ -1,6 +1,14 @@
+import AVFoundation
 import UIKit
 
 final class PenViewController: UIViewController, UIPencilInteractionDelegate {
+    // Local ink: how long a finished stroke stays before it fades out (the
+    // real stroke has arrived in the video by then), and the fade time.
+    static let localInkHoldMs = 300
+    static let localInkFadeMs = 150
+    static let localInkWidth: CGFloat = 2
+    static let localInkColor = UIColor(white: 0.25, alpha: 0.8)
+
     private let server = LoopbackServer(port: Wire.port)
     private let videoServer = LoopbackServer(port: Wire.videoPort)
     private let videoView = VideoView()
@@ -10,18 +18,34 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
     private let trailPath = UIBezierPath()
     private var lastSize = CGSize.zero
 
+    // Video state
+    private var videoShown = false
+    private var videoSize: CGSize?
+    private var localInkEnabled = true
+
+    // Local ink: one layer per stroke, inside a container clipped to the video.
+    private let inkContainer = CALayer()
+    private var inkStroke: CAShapeLayer?
+    private let inkPath = UIBezierPath()
+
+    // False while a stroke that started in the black bars goes on: it is not sent.
+    private var strokeInside = true
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
         view.isMultipleTouchEnabled = true
 
-        // Laptop screen, under the pen trail and the status line. Touches go
-        // through to this controller's view.
+        // Laptop screen, under the ink, the trail and the status line. Touches
+        // go through to this controller's view.
         videoView.frame = view.bounds
-        videoView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         videoView.isUserInteractionEnabled = false
         videoView.isHidden = true
         view.addSubview(videoView)
+
+        inkContainer.masksToBounds = true
+        inkContainer.isHidden = true
+        view.layer.addSublayer(inkContainer)
 
         trail.strokeColor = UIColor(white: 1.0, alpha: 0.25).cgColor
         trail.fillColor = nil
@@ -49,10 +73,24 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
         server.onConnected = { [weak self] in self?.sendHello() }
 
         decoder.onFirstFrame = { [weak self] in self?.showVideo(true) }
-        videoServer.onConnected = { [weak self] in self?.decoder.reset() }
+        decoder.onVideoSize = { [weak self] size in
+            self?.videoSize = size
+            self?.layoutVideo()
+        }
+        decoder.onConfig = { [weak self] flags in
+            self?.localInkEnabled = (flags & 0x01) != 0
+        }
+        videoServer.onConnected = { [weak self] in
+            guard let self = self else { return }
+            self.decoder.reset()
+            self.videoSize = nil
+            self.localInkEnabled = true
+        }
         videoServer.onDisconnected = { [weak self] in
-            self?.decoder.reset()
-            self?.showVideo(false)
+            guard let self = self else { return }
+            self.decoder.reset()
+            self.videoSize = nil
+            self.showVideo(false)
         }
         videoServer.onReceive = { [weak self] data in
             guard let self = self else { return }
@@ -78,6 +116,7 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         trail.frame = view.bounds
+        layoutVideo()
         if view.bounds.size != lastSize {
             lastSize = view.bounds.size
             sendHello()
@@ -99,20 +138,43 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
         videoServer.start()
     }
 
+    // MARK: Video
+
+    // Where the picture is: aspect fit (black bars) inside the view while the
+    // video is shown, else the whole view. Pen positions are relative to it.
+    private func videoRect() -> CGRect {
+        let bounds = view.bounds
+        guard videoShown, let size = videoSize, size.width > 0, size.height > 0 else { return bounds }
+        return AVMakeRect(aspectRatio: size, insideRect: bounds)
+    }
+
+    private func layoutVideo() {
+        let rect = videoRect()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        videoView.frame = rect  // the layer stretches to it (.resize), so the rect is exact
+        inkContainer.frame = rect
+        CATransaction.commit()
+    }
+
     // While the laptop screen is shown, it replaces the local trail and the
     // status line.
     private func showVideo(_ on: Bool) {
+        videoShown = on
         videoView.isHidden = !on
+        inkContainer.isHidden = !on
         trail.isHidden = on
         statusLabel.isHidden = on
         if on {
             trailPath.removeAllPoints()
             trail.path = nil
+        } else {
+            removeInk()
         }
+        layoutVideo()
     }
 
-    // The video fills the whole view with exact pixel mapping, so the laptop
-    // makes its virtual monitor this many pixels (landscape only: w > h).
+    // The hello gives the view in points and in pixels (landscape only: w > h).
     private func sendHello() {
         let size = view.bounds.size
         guard size.width > 0, size.height > 0 else { return }
@@ -124,49 +186,142 @@ final class PenViewController: UIViewController, UIPencilInteractionDelegate {
                                widthPx: widthPx, heightPx: heightPx, scale: Double(scale)))
     }
 
+    // MARK: Local ink (hides the video round trip while drawing)
+
+    private var inkActive: Bool { videoShown && localInkEnabled }
+
+    // Point in inkContainer coordinates.
+    private func inkPoint(_ touch: UITouch) -> CGPoint {
+        let p = touch.preciseLocation(in: view)
+        let rect = videoRect()
+        return CGPoint(x: p.x - rect.minX, y: p.y - rect.minY)
+    }
+
+    private func inkBegin(_ touch: UITouch) {
+        guard inkActive else { return }
+        let stroke = CAShapeLayer()
+        stroke.frame = inkContainer.bounds
+        stroke.strokeColor = PenViewController.localInkColor.cgColor
+        stroke.fillColor = nil
+        stroke.lineWidth = PenViewController.localInkWidth
+        stroke.lineCap = .round
+        stroke.lineJoin = .round
+        stroke.actions = ["path": NSNull(), "position": NSNull(), "bounds": NSNull()]
+        inkContainer.addSublayer(stroke)
+        inkStroke = stroke
+        inkPath.removeAllPoints()
+        inkPath.move(to: inkPoint(touch))
+        stroke.path = inkPath.cgPath
+    }
+
+    private func inkMove(_ samples: [UITouch], predicted: [UITouch]) {
+        guard let stroke = inkStroke else { return }
+        for sample in samples {
+            inkPath.addLine(to: inkPoint(sample))
+        }
+        // Predicted points (about one frame ahead) are shown but not kept.
+        if predicted.isEmpty {
+            stroke.path = inkPath.cgPath
+        } else {
+            let shown = UIBezierPath(cgPath: inkPath.cgPath)
+            for p in predicted {
+                shown.addLine(to: inkPoint(p))
+            }
+            stroke.path = shown.cgPath
+        }
+    }
+
+    // Keep the finished stroke for localInkHoldMs, then fade it out.
+    private func inkEnd(_ touch: UITouch, cancelled: Bool) {
+        guard let stroke = inkStroke else { return }
+        inkStroke = nil
+        if cancelled {
+            stroke.removeFromSuperlayer()
+            return
+        }
+        inkPath.addLine(to: inkPoint(touch))
+        stroke.path = inkPath.cgPath
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(PenViewController.localInkHoldMs)) {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(Double(PenViewController.localInkFadeMs) / 1000)
+            CATransaction.setCompletionBlock { stroke.removeFromSuperlayer() }
+            stroke.opacity = 0
+            CATransaction.commit()
+        }
+    }
+
+    private func removeInk() {
+        inkStroke = nil
+        for layer in inkContainer.sublayers ?? [] {
+            layer.removeFromSuperlayer()
+        }
+    }
+
     // MARK: Touches (Pencil only; fingers and palm are ignored)
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         for touch in touches where touch.type == .pencil {
-            trailPath.removeAllPoints()
-            trailPath.move(to: touch.preciseLocation(in: view))
             send(touch, phase: Wire.phaseDown)
+            if videoShown {
+                if strokeInside { inkBegin(touch) }
+            } else {
+                trailPath.removeAllPoints()
+                trailPath.move(to: touch.preciseLocation(in: view))
+                trail.path = trailPath.cgPath
+            }
         }
-        trail.path = trailPath.cgPath
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         for touch in touches where touch.type == .pencil {
             let samples = event?.coalescedTouches(for: touch) ?? [touch]
             for sample in samples {
-                trailPath.addLine(to: sample.preciseLocation(in: view))
                 send(sample, phase: Wire.phaseMove)
             }
+            if videoShown {
+                let predicted = event?.predictedTouches(for: touch) ?? []
+                inkMove(samples, predicted: predicted)
+            } else {
+                for sample in samples {
+                    trailPath.addLine(to: sample.preciseLocation(in: view))
+                }
+                trail.path = trailPath.cgPath
+            }
         }
-        trail.path = trailPath.cgPath
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         for touch in touches where touch.type == .pencil {
             send(touch, phase: Wire.phaseUp)
+            inkEnd(touch, cancelled: false)
         }
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         for touch in touches where touch.type == .pencil {
             send(touch, phase: Wire.phaseCancel)
+            inkEnd(touch, cancelled: true)
         }
     }
 
+    // Positions are fractions of the picture rect (the whole view without
+    // video). A stroke that starts in the black bars is not sent; a stroke
+    // that leaves the picture is clamped to its edge.
     private func send(_ touch: UITouch, phase: UInt8) {
-        let bounds = view.bounds
-        guard bounds.width > 0, bounds.height > 0 else { return }
+        let rect = videoRect()
+        guard rect.width > 0, rect.height > 0 else { return }
         let p = touch.preciseLocation(in: view)
+        let x = Double((p.x - rect.minX) / rect.width)
+        let y = Double((p.y - rect.minY) / rect.height)
+        if phase == Wire.phaseDown {
+            strokeInside = x >= 0 && x <= 1 && y >= 0 && y <= 1
+        }
+        guard strokeInside else { return }
         let maxForce = touch.maximumPossibleForce
         let pressure = maxForce > 0 ? touch.force / maxForce : 0
         server.send(Wire.sample(phase: phase,
-                                x: Double(p.x / bounds.width),
-                                y: Double(p.y / bounds.height),
+                                x: min(max(x, 0), 1),
+                                y: min(max(y, 0), 1),
                                 pressure: Double(pressure),
                                 altitude: Double(touch.altitudeAngle),
                                 azimuth: Double(touch.azimuthAngle(in: view)),

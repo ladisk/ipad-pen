@@ -65,23 +65,40 @@ Python: `struct.Struct("<BBd")`.
 
 ## Video connection (port 27016)
 
-The laptop sends one frame per H.264 access unit (one encoded picture):
+The laptop sends messages. Each message:
 
-| Offset | Type      | Field                                    |
-|--------|-----------|------------------------------------------|
-| 0      | u32       | length N of the access unit in bytes     |
-| 4      | N bytes   | access unit, Annex-B (start code before every NAL unit) |
+| Offset | Type    | Field                                      |
+|--------|---------|--------------------------------------------|
+| 0      | u32     | length N = 1 + payload size                |
+| 4      | u8      | kind                                       |
+| 5      | N - 1   | payload                                    |
 
-Python: `struct.Struct("<I")` + data. N is 1 to 16 MiB; the iPad drops the
-connection on any other value.
+Python: `struct.Struct("<IB")` + payload. N is 2 to 16 MiB; the iPad drops
+the connection on any other value or an unknown kind.
 
-The stream is H.264 High profile, no B-frames, in decode order with no
-timestamps: the iPad shows every picture as soon as it is decoded. The
-picture size is the pixel size from the hello. Every keyframe (IDR) has SPS
-and PPS in front of it. The first frame after the connection opens is a
-keyframe; there is one about every 60 pictures. The laptop restarts the
-encoder for every connection, and the iPad drops pictures until the first
-keyframe. A new SPS/PPS (other size) can come at any keyframe.
+| Kind | Name        | Payload                                                        |
+|------|-------------|----------------------------------------------------------------|
+| 3    | config      | `u8` flags; bit 0 = local ink on. Sent first, once.             |
+| 1    | size        | `u16` width, `u16` height of the picture in pixels. Sent before the first access unit. |
+| 2    | access unit | one H.264 access unit (one picture), Annex-B (start code before every NAL unit) |
+
+The picture is H.264 High profile, no B-frames, in decode order with no
+timestamps: the iPad shows every picture as soon as it is decoded. Every
+keyframe (IDR) has SPS and PPS in front of it. The first picture after the
+connection opens is a keyframe; there is one about every 60 pictures. The
+laptop restarts the encoder for every connection, and the iPad drops
+pictures until the first keyframe.
+
+The iPad shows the picture aspect-fit (black bars where the aspect ratio of
+the picture and the screen differ). While the picture is shown, the pen
+position in a sample is a fraction of the picture rectangle, not of the view:
+(0, 0) is the top left pixel of the picture. A stroke that starts in a black
+bar is not sent; a stroke that leaves the picture is clamped to its edge.
+Without video the position is a fraction of the whole view.
+
+Local ink: the iPad draws the current stroke itself (thin grey line, clipped
+to the picture) and fades it out about 300 ms after the pen goes up, when the
+real stroke has arrived in the video. The laptop turns it off with flags = 0.
 
 ## Compatibility
 

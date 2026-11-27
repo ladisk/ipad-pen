@@ -12,13 +12,20 @@ final class VideoView: UIView {
     }
 }
 
-// Reads the video connection (u32 little-endian length + one H.264 access
-// unit in Annex-B format, see PROTOCOL.md) and shows every access unit on an
+// Reads the video connection (messages: u32 little-endian length, u8 kind,
+// payload; see PROTOCOL.md) and shows every H.264 access unit on an
 // AVSampleBufferDisplayLayer. Runs on the main queue.
 final class VideoDecoder {
     static let maxFrame = 16 << 20
+    static let kindSize: UInt8 = 1
+    static let kindAccessUnit: UInt8 = 2
+    static let kindConfig: UInt8 = 3
 
     var onFirstFrame: (() -> Void)?
+    // Picture size in pixels (kind 1).
+    var onVideoSize: ((CGSize) -> Void)?
+    // Config flags (kind 3); bit 0 = local ink.
+    var onConfig: ((UInt8) -> Void)?
 
     private let layer: AVSampleBufferDisplayLayer
     private var buffer = [UInt8]()
@@ -56,18 +63,35 @@ final class VideoDecoder {
             let b1 = Int(buffer[offset + 1]) << 8
             let b2 = Int(buffer[offset + 2]) << 16
             let b3 = Int(buffer[offset + 3]) << 24
-            let length = b0 | b1 | b2 | b3
-            if length == 0 || length > VideoDecoder.maxFrame {
+            let length = b0 | b1 | b2 | b3  // kind byte + payload
+            if length < 2 || length > VideoDecoder.maxFrame {
                 buffer.removeAll()
                 return false
             }
             let start = offset + 4
             if buffer.count - start < length { break }
-            decode(Array(buffer[start..<(start + length)]))
+            let kind = buffer[start]
+            let payload = Array(buffer[(start + 1)..<(start + length)])
             offset = start + length
+            if kind == VideoDecoder.kindAccessUnit {
+                decode(payload)
+            } else if kind == VideoDecoder.kindSize {
+                if payload.count >= 4 {
+                    let w = Int(payload[0]) | Int(payload[1]) << 8
+                    let h = Int(payload[2]) | Int(payload[3]) << 8
+                    onVideoSize?(CGSize(width: w, height: h))
+                }
+            } else if kind == VideoDecoder.kindConfig {
+                if let flags = payload.first {
+                    onConfig?(flags)
+                }
+            } else {
+                buffer.removeAll()
+                return false
+            }
         }
         if offset > 0 {
-            buffer.removeFirst(offset)
+            buffer.removeFirst(min(offset, buffer.count))
         }
         return true
     }

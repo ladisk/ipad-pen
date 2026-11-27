@@ -45,8 +45,30 @@ def find_render_node(drm: Path = Path("/sys/class/drm")) -> str | None:
     return f"/dev/dri/{nodes[0].name}" if nodes else None
 
 
+def fit_size(width: int, height: int, max_width: int) -> tuple[int, int]:
+    """Scale a picture down to at most ``max_width`` wide, keeping the aspect ratio.
+
+    Parameters
+    ----------
+    width, height : int
+        Source size in pixels.
+    max_width : int
+        Largest output width.
+
+    Returns
+    -------
+    (int, int)
+        Even width and height (H.264 with 4:2:0 needs even sizes).
+    """
+    if width > max_width:
+        height = round(height * max_width / width)
+        width = max_width
+    return width - width % 2, height - height % 2
+
+
 def wf_recorder_argv(output: str, render_node: str | None = None, bitrate_mbit: float = 20.0,
-                     gop: int = 60, program: str = "wf-recorder") -> list[str]:
+                     gop: int = 60, program: str = "wf-recorder",
+                     size: tuple[int, int] | None = None) -> list[str]:
     """Command that captures ``output`` and writes low-latency H.264 in FLV to stdout.
 
     Parameters
@@ -61,6 +83,8 @@ def wf_recorder_argv(output: str, render_node: str | None = None, bitrate_mbit: 
         Frames between IDR frames.
     program : str, optional
         wf-recorder executable.
+    size : (int, int), optional
+        Scale the picture to this size on the GPU; default is the output's size.
 
     Returns
     -------
@@ -71,6 +95,9 @@ def wf_recorder_argv(output: str, render_node: str | None = None, bitrate_mbit: 
     argv = [program, "-o", output, "-c", "h264_vaapi"]
     if render_node:
         argv += ["-d", render_node]
+    if size:
+        # Replaces wf-recorder's own filter (scale_vaapi=format=nv12:out_range=full).
+        argv += ["-F", f"scale_vaapi=w={size[0]}:h={size[1]}:format=nv12:out_range=full"]
     argv += ["-b", "0"]
     for opt in ("bf=0", f"g={gop}", "rc_mode=CBR", f"b={rate}", f"maxrate={rate}", "profile=high"):
         argv += ["-p", opt]

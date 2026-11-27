@@ -4,9 +4,9 @@ import asyncio
 import contextlib
 import logging
 
-from ipad_pen.protocol import Hello, ProtocolError, encode_video, read_frame
+from ipad_pen.protocol import Hello, ProtocolError, encode_video, encode_video_config, encode_video_size, read_frame
 from ipad_pen.tablet import Mapper
-from ipad_pen.video import stream_encoder
+from ipad_pen.video import fit_size, stream_encoder
 
 log = logging.getLogger("ipad_pen")
 
@@ -60,35 +60,80 @@ async def open_tcp(host: str, port: int):
 
 
 class Display:
-    """Virtual monitor on the iPad: headless output, tablet mapping and video stream.
+    """Show a laptop output on the iPad: video stream plus tablet mapping.
+
+    Lecture mode mirrors a real output (the projector); desk mode creates a
+    headless output (a virtual monitor) for the iPad.
 
     Parameters
     ----------
     hypr : Hyprland
-        Creates the output and maps the tablet.
+        Queries outputs, creates the headless one, maps the tablet.
     connect_video : coroutine function
         Returns ``(reader, writer)`` of the video connection to the iPad.
     encoder_argv : callable
-        ``encoder_argv(output_name)`` returns the encoder command (FLV on stdout).
-    name : str, optional
-        Name of the headless output.
+        ``encoder_argv(output_name, size)`` returns the encoder command (FLV on
+        stdout); ``size`` is the picture size to scale to, or None.
+    mode : str, optional
+        ``"lecture"`` or ``"desk"``.
+    output : str, optional
+        Lecture mode: output to mirror, ``"auto"`` = the focused output when the
+        iPad connects.
+    max_width : int, optional
+        Lecture mode: scale the picture down to at most this width.
+    desk_name : str, optional
+        Desk mode: name of the headless output.
+    desk_size : (int, int), optional
+        Desk mode: size of the headless output in pixels.
+    desk_scale : float, optional
+        Desk mode: Hyprland scale of the headless output.
+    local_ink : bool, optional
+        Tell the iPad to draw the current stroke itself until the video shows it.
     """
 
-    def __init__(self, hypr, connect_video, encoder_argv, name: str = "IPAD"):
+    def __init__(self, hypr, connect_video, encoder_argv, mode: str = "lecture", output: str = "auto",
+                 max_width: int = 1920, desk_name: str = "IPAD", desk_size: tuple[int, int] = (1366, 1024),
+                 desk_scale: float = 1.0, local_ink: bool = True):
+        if mode not in ("lecture", "desk"):
+            raise ValueError(f"unknown mode {mode!r}")
         self.hypr = hypr
         self.connect_video = connect_video
         self.encoder_argv = encoder_argv
-        self.name = name
+        self.mode = mode
+        self.output = output
+        self.max_width = max_width
+        self.desk_name = desk_name
+        self.desk_size = desk_size
+        self.desk_scale = desk_scale
+        self.local_ink = local_ink
+
+    def _prepare(self) -> tuple[str, tuple[int, int], tuple[int, int] | None]:
+        """Pick or create the output. Returns (name, picture size, encoder scale size or None)."""
+        if self.mode == "desk":
+            w, h = self.desk_size
+            pos = self.hypr.create_output(self.desk_name, w, h, self.desk_scale)
+            log.info("desk mode: virtual monitor %s %dx%d scale %g at %s", self.desk_name, w, h,
+                     self.desk_scale, pos)
+            return self.desk_name, (w, h), None
+        name = self.output
+        if name == "auto":
+            name = self.hypr.focused_output()
+        native = self.hypr.output_size(name)
+        size = fit_size(*native, self.max_width)
+        log.info("lecture mode: mirroring %s (%dx%d, sent as %dx%d)%s", name, *native, *size,
+                 " [focused output]" if self.output == "auto" else "")
+        return name, size, (size if size != native else None)
 
     async def run(self, hello: Hello, mapper: Mapper) -> None:
-        """Show the virtual monitor on the iPad until the video connection or the encoder ends.
+        """Show the output on the iPad until the video connection or the encoder ends.
 
         Parameters
         ----------
         hello : Hello
-            Version 2 hello with the pixel size and scale.
+            Version 2 hello.
         mapper : Mapper
-            Its aspect crop is turned off while the display runs.
+            Its aspect crop is turned off while the display runs (the iPad
+            sends pen positions relative to the picture).
         """
         try:
             reader, writer = await self.connect_video()
@@ -97,12 +142,11 @@ class Display:
             return
         aspect = mapper.aspect
         try:
-            scale = hello.scale if hello.scale > 0 else 2.0
-            pos = self.hypr.create_output(self.name, hello.width_px, hello.height_px, scale)
-            log.info("virtual monitor %s %dx%d scale %g at %s", self.name, hello.width_px, hello.height_px,
-                     scale, pos)
-            self.hypr.set_tablet_output(self.name)
-            mapper.aspect = None  # the iPad shows the whole output: use the full area
+            name, size, scale_to = self._prepare()
+            self.hypr.set_tablet_output(name)
+            mapper.aspect = None
+            writer.write(encode_video_config(self.local_ink))
+            writer.write(encode_video_size(*size))
 
             async def send(au: bytes) -> None:
                 writer.write(encode_video(au))
@@ -112,7 +156,7 @@ class Display:
                 while await reader.read(4096):
                     pass
 
-            stream = asyncio.create_task(stream_encoder(self.encoder_argv(self.name), send))
+            stream = asyncio.create_task(stream_encoder(self.encoder_argv(name, scale_to), send))
             closed = asyncio.create_task(ipad_closed())
             try:
                 done, _ = await asyncio.wait({stream, closed}, return_when=asyncio.FIRST_COMPLETED)
@@ -130,12 +174,15 @@ class Display:
             self._teardown()
 
     def _teardown(self) -> None:
-        for step in (lambda: self.hypr.set_tablet_output("current"), lambda: self.hypr.remove_output(self.name)):
+        steps = [lambda: self.hypr.set_tablet_output("current")]
+        if self.mode == "desk":
+            steps.append(lambda: self.hypr.remove_output(self.desk_name))
+        for step in steps:
             try:
                 step()
             except Exception as exc:  # noqa: BLE001 - best effort, also during shutdown
                 log.warning("cleanup failed: %s", exc)
-        log.info("virtual monitor %s removed", self.name)
+        log.info("display stopped, tablet mapped to the focused monitor again")
 
 
 async def _run_display(display: Display, hello: Hello, mapper: Mapper) -> None:
